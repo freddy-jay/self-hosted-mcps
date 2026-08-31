@@ -1,0 +1,9 @@
+FROM localhost/mcps-base:1
+
+COPY . /app
+WORKDIR /app/__WORKDIR__
+RUN __INSTALL__
+
+ENV MCP_CMD=__RUNCMD__
+EXPOSE 8080
+CMD ["node", "/usr/local/lib/mcps-gateway.js"]

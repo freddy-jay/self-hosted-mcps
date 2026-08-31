@@ -1,0 +1,736 @@
+"""mcps - self-host any MCP server in a Podman pod, reachable only over your tailnet."""
+from __future__ import annotations
+
+import ipaddress
+import json
+import re
+import os
+import secrets
+import hashlib
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from . import autostart as boot
+from . import config, detect, podman, probe, tailnet
+
+app = typer.Typer(add_completion=False, no_args_is_help=True, help=__doc__)
+console = Console()
+err = Console(stderr=True)
+
+META_DIR = config.HOME / "servers"
+
+
+def fail(message: str) -> None:
+    err.print(f"[red]x[/red] {message}")
+    raise typer.Exit(1)
+
+
+def meta_path(name: str) -> Path:
+    return META_DIR / f"{name}.json"
+
+
+def write_meta(name: str, data: dict) -> None:
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    meta_path(name).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def read_meta(name: str) -> dict:
+    path = meta_path(name)
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+BRIDGE_PORT = 8081   # supergateway, ungated
+GATEWAY_PORT = 8080  # our gateway: bearer token, optional IP allowlist
+
+
+def serve_config(https: bool, public: bool = False) -> str:
+    """One listener on the standard port.
+
+    Tailnet-only servers go straight to the bridge, since Tailscale ACLs already
+    gate them. Public servers put the gateway behind Funnel on 443 - clients that
+    reach a connector over the internet will not follow a non-standard port.
+    """
+    port, scheme = ("443", "HTTPS") if https else ("80", "HTTP")
+    host = "${TS_CERT_DOMAIN}:" + port
+    upstream = GATEWAY_PORT if public else BRIDGE_PORT
+    return json.dumps({
+        "TCP": {port: {scheme: True}},
+        "Web": {host: {"Handlers": {"/": {"Proxy": f"http://127.0.0.1:{upstream}"}}}},
+        "AllowFunnel": {host: public},
+    })
+
+
+def funnel_acl(cfg: dict) -> str:
+    """The policy that lets a node use Funnel, scoped to a tag when one is set."""
+    tags = re.findall(r"tag:[\w-]+", cfg.get("ts_extra_args", ""))
+    if not tags:
+        return json.dumps(
+            {"nodeAttrs": [{"target": ["autogroup:member"], "attr": ["funnel"]}]}, indent=2
+        )
+    return json.dumps(
+        {
+            "tagOwners": {tag: ["autogroup:admin"] for tag in tags},
+            "nodeAttrs": [{"target": tags, "attr": ["funnel"]}],
+        },
+        indent=2,
+    )
+
+
+def funnel_active(ts_container: str) -> bool:
+    """Funnel is ACL-gated and fails silently, so confirm it rather than assume it."""
+    result = subprocess.run(
+        ["podman", "exec", ts_container, "tailscale", "funnel", "status"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and "Funnel on" in result.stdout
+
+
+# Anthropic's published outbound range - the addresses their MCP calls come from.
+# https://platform.claude.com/docs/en/api/ip-addresses  (override with MCPS_ANTHROPIC_CIDRS)
+ANTHROPIC_CIDRS = os.environ.get("MCPS_ANTHROPIC_CIDRS", "160.79.104.0/21")
+
+
+def read_authkey() -> str:
+    return podman.secret_get(config.AUTHKEY_SECRET)
+
+
+def migrate_authkey(cfg: dict) -> None:
+    """Older versions kept the key in config.json; move it into a podman secret."""
+    stale = cfg.pop("authkey", "")
+    if stale:
+        podman.secret_set(config.AUTHKEY_SECRET, stale)
+        config.save(cfg)
+
+
+def token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()[:12]
+
+
+def server_url(cfg: dict, name: str, dns_name: str) -> str:
+    scheme = "https" if cfg["https"] else "http"
+    host = dns_name or f"mcp-{name}.{cfg.get('tailnet', '')}"
+    return f"{scheme}://{host}/mcp"
+
+
+def local_healthy(app_container: str) -> bool:
+    """Is the bridge answering inside the pod? Separates the app leg from the tailnet leg."""
+    script = (
+        f"fetch('http://127.0.0.1:{BRIDGE_PORT}/healthz')"
+        ".then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+    )
+    probe_run = subprocess.run(
+        ["podman", "exec", app_container, "node", "-e", script], capture_output=True
+    )
+    return probe_run.returncode == 0
+
+
+def report_broken(name: str, url: str, reason: str, local_ok: bool) -> None:
+    err.print(f"[red]x[/red] {name} started but did not answer an MCP handshake: {reason}")
+    if local_ok:
+        err.print(f"  The server is up inside the pod, so the tailnet leg failed for {url}.")
+        err.print("  HTTPS certificates are a separate toggle from MagicDNS in the Tailscale admin panel.")
+        err.print(f"  Enable them, or fall back to plain HTTP: mcps init --http && mcps add ... --force")
+    else:
+        err.print("  The MCP process itself is not answering - usually a missing API key or a bad entrypoint.")
+        err.print(f"  See: mcps logs {name}")
+        err.print(f"  Then re-run add with -e KEY=VALUE or --cmd, plus --force.")
+    err.print(f"  The pod is left running so you can inspect it. Remove it with: mcps rm {name}")
+
+
+DNS_LAG = "getaddrinfo failed"
+
+
+# The gateway owns these; letting a user secret target one would collide with it.
+RESERVED_ENV = {"MCP_TOKEN", "MCP_ALLOW_CIDRS", "MCP_CMD", "MCP_PORT"}
+
+
+def store_env(name: str, pairs: dict[str, str], previous: dict) -> list[str]:
+    """Each variable becomes its own podman secret, so no value lands on disk.
+
+    Supplying no -e on a rebuild keeps the variables the server already had.
+    """
+    for key, value in pairs.items():
+        podman.secret_set(podman.env_secret_name(name, key), value)
+    # Anything already stored for this server - including secrets seeded with
+    # `mcps secrets add` before the server existed - is carried over.
+    kept = [k for k in previous.get("env_keys", []) if podman.secret_get(podman.env_secret_name(name, k))]
+    return sorted((set(kept) | set(pairs)) - RESERVED_ENV)
+
+
+def app_args(name: str, env_keys: list[str], has_token: bool, allow_cidrs: str, silent: bool = False) -> tuple[str, ...]:
+    """Everything the app container needs beyond its image."""
+    args: list[str] = []
+    for key in env_keys:
+        secret = podman.env_secret_name(name, key)
+        if podman.secret_get(secret):
+            args += ["--secret", f"{secret},type=env,target={key}"]
+    if has_token:
+        args += ["--secret", f"{podman.secret_name(name, 'token')},type=env,target=MCP_TOKEN"]
+    if allow_cidrs:
+        args += ["-e", f"MCP_ALLOW_CIDRS={allow_cidrs}"]
+    if silent:
+        args += ["-e", "MCP_SILENT=1"]
+    return tuple(args)
+
+
+def restart_app(name: str) -> None:
+    """Recreate the app container from its stored metadata, picking up new secrets."""
+    meta = read_meta(name)
+    pod = podman.pod_name(name)
+    podman.run("rm", "-f", "-t", "3", f"{pod}-app", check=False)
+    podman.run(
+        "run", "-d", "--pod", pod, "--name", f"{pod}-app", "--restart", "always",
+        *app_args(
+            name,
+            list(meta.get("env_keys", [])),
+            bool(podman.secret_get(podman.secret_name(name, "token"))),
+            meta.get("allow_cidrs", ""),
+            bool(meta.get("silent")),
+        ),
+        meta.get("image", f"localhost/mcps-{name}:latest"),
+    )
+
+
+def wait_online(container: str, timeout: int = 90) -> tuple[str, str]:
+    """Block until tailscaled is up; return (dns_name, tailscale_ip)."""
+    deadline = time.time() + timeout
+    last = "starting"
+    while time.time() < deadline:
+        proc = subprocess.run(
+            ["podman", "exec", container, "tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0:
+            try:
+                status = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                status = {}
+            last = status.get("BackendState", last)
+            if last == "Running":
+                self_node = status.get("Self") or {}
+                ips = self_node.get("TailscaleIPs") or [""]
+                return self_node.get("DNSName", "").strip("."), ips[0]
+            if last == "NeedsLogin":
+                fail(
+                    "tailscale rejected the auth key. Generate a new reusable, "
+                    "ephemeral, pre-approved key and run: mcps init"
+                )
+        exists = subprocess.run(
+            ["podman", "container", "exists", container], capture_output=True
+        )
+        if exists.returncode != 0:
+            fail(f"the tailscale container exited. See: podman logs {container}")
+        time.sleep(2)
+    fail(f"tailscale did not come online within {timeout}s (state: {last}). See: podman logs {container}")
+    raise AssertionError  # unreachable
+
+
+@app.command()
+def init(
+    authkey: str = typer.Option("", "--authkey", "-k", help="Tailscale auth key (reusable + ephemeral + pre-approved)."),
+    https: bool = typer.Option(True, "--https/--http", help="Serve HTTPS on the tailnet (needs MagicDNS + HTTPS certs enabled)."),
+    tags: str = typer.Option("", "--tags", help="Extra tailscaled args, e.g. --advertise-tags=tag:mcp"),
+) -> None:
+    """Store your Tailscale auth key and detect your tailnet."""
+    try:
+        podman.preflight()
+    except podman.PodmanError as exc:
+        fail(str(exc))
+
+    cfg = config.load()
+    migrate_authkey(cfg)
+    authkey = authkey or os.environ.get("TS_AUTHKEY", "")
+    stored = read_authkey()
+    if not authkey and not stored:
+        authkey = typer.prompt("Tailscale auth key (tailscale.com/admin/settings/keys)", hide_input=True)
+
+    if authkey:
+        if not authkey.startswith("tskey-"):
+            fail("that does not look like a Tailscale auth key (expected it to start with 'tskey-').")
+        podman.secret_set(config.AUTHKEY_SECRET, authkey.strip())
+    cfg["https"] = https
+    if tags:
+        cfg["ts_extra_args"] = tags
+    suffix = tailnet.magic_dns_suffix()
+    if suffix:
+        cfg["tailnet"] = suffix
+    config.save(cfg)
+
+    verb = "stored" if authkey else "kept"
+    console.print(f"[green]+[/green] key {verb} as podman secret {config.AUTHKEY_SECRET}")
+    if cfg.get("ts_extra_args"):
+        console.print(f"  tailscaled args: {cfg['ts_extra_args']}")
+    console.print(f"  settings: {config.CONFIG_PATH}")
+    tail = cfg.get("tailnet") or "[yellow]unknown - install Tailscale on this machine[/yellow]"
+    console.print(f"  tailnet: {tail}")
+
+
+@app.command()
+def add(
+    target: str = typer.Argument(..., help="GitHub URL or owner/repo, or npm:<pkg>, or pypi:<pkg>."),
+    name: str = typer.Option("", "--name", "-n", help="Name on your tailnet (default: repo name)."),
+    cmd: str = typer.Option("", "--cmd", help="Override the stdio command the server is started with."),
+    ref: str = typer.Option("", "--ref", help="Git branch or tag."),
+    subdir: str = typer.Option("", "--subdir", help="Path inside the repo, for monorepos."),
+    env: list[str] = typer.Option([], "--env", "-e", help="Environment variable KEY=VALUE, repeatable."),
+    env_file: Path = typer.Option(None, "--env-file", exists=True, help="File of KEY=VALUE lines."),
+    public: bool = typer.Option(False, "--public", help="Also expose it on the public internet via Tailscale Funnel, behind a bearer token. Needed for claude.ai."),
+    silent: bool = typer.Option(False, "--silent", help="Drop unauthorised requests without a reply, instead of answering 401."),
+    new_token: bool = typer.Option(False, "--new-token", help="Rotate the bearer token instead of keeping the existing one."),
+    token_stdin: bool = typer.Option(False, "--token-stdin", help="Read the bearer token from stdin, e.g. from a password manager."),
+    allow: list[str] = typer.Option([], "--allow", help="CIDR allowed to reach a --public server, repeatable. Defaults to Anthropic's outbound range; 'any' disables the check."),
+    rebuild_base: bool = typer.Option(False, "--rebuild-base", help="Rebuild the shared runtime image."),
+    force: bool = typer.Option(False, "--force", "-f", help="Replace an existing server with this name."),
+) -> None:
+    """Build an MCP server and put it on your tailnet."""
+    try:
+        podman.preflight()
+    except podman.PodmanError as exc:
+        fail(str(exc))
+
+    cfg = config.load()
+    migrate_authkey(cfg)
+    if not read_authkey():
+        fail("no Tailscale auth key yet. Run: mcps init")
+    if public and not cfg["https"]:
+        fail("--public needs HTTPS: Funnel is TLS-only on port 443. Run: mcps init --https")
+
+    name = name or detect.default_name(target)
+    previous = read_meta(name)
+    if podman.pod_exists(name):
+        if not force:
+            fail(f"'{name}' already exists. Use --force to replace it, or mcps rm {name}.")
+        podman.destroy(name)
+
+    # Keep the token stable across rebuilds so an already-configured client keeps working.
+    token = ""
+    if public:
+        if token_stdin:
+            token = sys.stdin.read().strip()
+            if not token:
+                fail("--token-stdin got nothing on stdin.")
+        elif not new_token:
+            token = podman.secret_get(podman.secret_name(name, "token"))
+        token = token or secrets.token_urlsafe(32)  # 256 bits, nothing human types it
+
+    # Off by default: Tailscale Funnel does not hand the backend the real client
+    # address, so an IP allowlist there blocks everything, Anthropic included.
+    # Opt in with --allow only where a genuine client IP reaches the gateway.
+    allow_cidrs = ""
+    if public and allow:
+        chosen = allow
+        if "any" not in [c.strip().lower() for c in chosen]:
+            for entry in chosen:
+                try:
+                    ipaddress.ip_network(entry.strip(), strict=False)
+                except ValueError:
+                    fail(f"--allow expects a CIDR or 'any', got: {entry}")
+            allow_cidrs = ",".join(c.strip() for c in chosen)
+
+    pairs: dict[str, str] = {}
+    for item in env:
+        if "=" not in item:
+            fail(f"--env expects KEY=VALUE, got: {item}")
+        key, value = item.split("=", 1)
+        if key in RESERVED_ENV:
+            fail(f"{key} is set by mcps itself. Use --token-stdin or --allow instead of -e {key}.")
+        pairs[key] = value
+    if env_file:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                pairs.setdefault(key, value)
+    if token:
+        pairs["MCP_TOKEN"] = token
+
+    console.print(f"[cyan]->[/cyan] fetching {target}")
+    try:
+        source = detect.fetch(target, name, ref or None, subdir or None)
+        install, run_cmd = detect.detect(source)
+    except detect.DetectError as exc:
+        fail(str(exc))
+    if cmd:
+        run_cmd = cmd
+    console.print(f"[cyan]->[/cyan] command: [bold]{run_cmd}[/bold]")
+
+    console.print("[cyan]->[/cyan] building image")
+    try:
+        podman.ensure_base_image(rebuild_base)
+    except podman.PodmanError as exc:
+        fail(str(exc))
+
+    template = (podman.RUNTIME / "mcp.Containerfile.tmpl").read_text(encoding="utf-8")
+    containerfile = source.context / "Containerfile.mcps"
+    containerfile.write_text(
+        template.replace("__WORKDIR__", source.workdir)
+        .replace("__INSTALL__", install)
+        .replace("__RUNCMD__", json.dumps(run_cmd)),
+        encoding="utf-8",
+    )
+    image = f"localhost/mcps-{name}:latest"
+    if podman.stream("build", "-t", image, "-f", str(containerfile), str(source.context)) != 0:
+        fail("image build failed. Fix the build, or pass --cmd if the entrypoint was guessed wrong.")
+
+    console.print("[cyan]->[/cyan] starting pod")
+    volume = f"mcps-ts-{name}"
+    pod = podman.pod_name(name)
+    ts_container = f"{pod}-ts"
+    try:
+        podman.write_serve_config(volume, serve_config(cfg["https"], public))
+        podman.run(
+            "pod", "create", "--name", pod,
+            "--label", f"mcps.name={name}",
+            "--label", f"mcps.origin={source.origin}",
+            "--label", f"mcps.cmd={run_cmd}",
+            "--label", f"mcps.public={str(public).lower()}",
+        )
+        extra = ("-e", f"TS_EXTRA_ARGS={cfg['ts_extra_args']}") if cfg.get("ts_extra_args") else ()
+        podman.run(
+            "run", "-d", "--pod", pod, "--name", ts_container, "--restart", "always",
+            "--secret", f"{config.AUTHKEY_SECRET},type=env,target=TS_AUTHKEY",
+            "-e", f"TS_HOSTNAME=mcp-{name}",
+            "-e", "TS_USERSPACE=true",
+            "-e", "TS_STATE_DIR=/var/lib/tailscale",
+            "-e", "TS_SERVE_CONFIG=/var/lib/tailscale/serve.json",
+            *extra,
+            "-v", f"{volume}:/var/lib/tailscale",
+            podman.TS_IMAGE,
+        )
+        env_keys = store_env(name, pairs, previous)
+        if token:
+            podman.secret_set(podman.secret_name(name, "token"), token)
+        podman.run(
+            "run", "-d", "--pod", pod, "--name", f"{pod}-app", "--restart", "always",
+            *app_args(name, env_keys, bool(token), allow_cidrs, silent),
+            image,
+        )
+    except podman.PodmanError as exc:
+        podman.destroy(name)
+        fail(str(exc))
+
+    try:
+        dns_name, ip = wait_online(ts_container)
+    except typer.Exit:
+        podman.destroy(name)
+        raise
+
+    url = server_url(cfg, name, dns_name)
+    exposed = url if public else ""
+    write_meta(name, {
+        "public_url": exposed,
+        "name": name, "origin": source.origin, "cmd": run_cmd,
+        "url": url, "ip": ip, "image": image, "public": public,
+        "token_fingerprint": token_fingerprint(token) if token else "",
+        "allow_cidrs": allow_cidrs, "env_keys": env_keys, "silent": silent,
+    })
+
+    console.print("[cyan]->[/cyan] handshaking with the server")
+    try:
+        server_name = probe.initialize(url, token)
+    except probe.ProbeError as exc:
+        healthy = local_healthy(f"{pod}-app")
+        # A newly registered node takes a while to reach this machine's MagicDNS
+        # cache, and a tagged node stays invisible until an ACL grants access to
+        # the tag. Both are local resolution problems, not a broken server.
+        if healthy and DNS_LAG in str(exc).lower():
+            err.print(f"[yellow]![/yellow] {url} does not resolve from this machine yet.")
+            err.print("  The server answers inside the pod, so this is DNS on your side:")
+            err.print("  a new node takes a moment, and a tagged node needs an ACL that grants")
+            err.print(f"  access to its tag, e.g. {{\"action\": \"accept\", \"src\": [\"autogroup:member\"], \"dst\": [\"tag:mcp:*\"]}}")
+            server_name = "not reachable from this machine yet"
+        else:
+            report_broken(name, url, str(exc), healthy)
+            raise typer.Exit(1)
+
+    console.print(f"\n[green]+[/green] [bold]{name}[/bold] is live ({server_name})")
+    show_endpoint(name, url, exposed, token, public, ts_container, allow_cidrs)
+
+
+def show_endpoint(
+    name: str, url: str, exposed: str, token: str,
+    public: bool, ts_container: str, allow_cidrs: str = "",
+) -> None:
+    if not public:
+        console.print(f"\n  on your tailnet:  [bold]{url}[/bold]")
+        console.print(f"  claude mcp add --transport http {name} {url}")
+        console.print("\n  Any device on your tailnet can reach it, Claude Code and Claude Desktop included.")
+        console.print("  claude.ai runs off your tailnet - re-run with --public to add a Funnel endpoint.")
+        console.print(json.dumps({"mcpServers": {name: {"type": "http", "url": url}}}, indent=2))
+        return
+
+    hostname = exposed.split("://", 1)[-1].split("/", 1)[0]
+    if not funnel_active(ts_container) or probe.resolves_publicly(hostname) is False:
+        err.print(f"\n[yellow]![/yellow] {hostname} does not resolve on the public internet, so nothing")
+        err.print("  outside your tailnet can reach it. Tailscale accepts the Funnel config locally and")
+        err.print("  publishes DNS only once the tailnet policy grants the funnel attribute.")
+        err.print(f"  Add this at login.tailscale.com/admin/acls, then: mcps restart {name}")
+        err.print(funnel_acl(config.load()))
+        return
+
+    console.print(f"\n  on the public internet, with the bearer token:")
+    console.print(f"    [bold]{url}[/bold]")
+    console.print(f"  or with the token in the URL, for clients that cannot set headers:")
+    console.print(f"    [bold]{url}/{token}[/bold]")
+    console.print(f"\n  token: [bold]{token}[/bold]  (also in {meta_path(name)})")
+    console.print(
+        f'\n  claude mcp add --transport http {name} {exposed} --header "Authorization: Bearer {token}"'
+    )
+    console.print(
+        "\n  For claude.ai: add a custom connector on the public URL. Paste the bearer token into\n"
+        "  the header field if your account has one, otherwise use the token-in-URL form."
+    )
+
+
+@app.command("ls")
+def list_servers() -> None:
+    """List your self-hosted MCP servers."""
+    try:
+        podman.preflight()
+        pods = podman.list_pods()
+    except podman.PodmanError as exc:
+        fail(str(exc))
+
+    if not pods:
+        console.print("No MCP servers yet. Add one: [bold]mcps add owner/repo[/bold]")
+        return
+
+    table = Table(box=None, pad_edge=False)
+    for column in ("NAME", "STATUS", "URL", "SOURCE"):
+        table.add_column(column, overflow="fold")
+    for pod in sorted(pods, key=lambda p: (p.get("Labels") or {})["mcps.name"]):
+        labels = pod.get("Labels") or {}
+        name = labels["mcps.name"]
+        meta = read_meta(name)
+        state = (pod.get("Status") or "?").lower()
+        colour = "green" if state.startswith("running") else "yellow"
+        table.add_row(name, f"[{colour}]{state}[/{colour}]", meta.get("url", "-"), labels.get("mcps.origin", "-"))
+    console.print(table)
+
+
+@app.command("rm")
+def remove(
+    name: str = typer.Argument(..., help="Server name."),
+    keep_image: bool = typer.Option(False, "--keep-image", help="Leave the built image on disk."),
+) -> None:
+    """Remove a server, its tailnet node and its data."""
+    known = (
+        podman.pod_exists(name)
+        or meta_path(name).exists()
+        or bool(podman.secret_get(podman.secret_name(name, "token")))
+        or bool(podman.secret_names(f"mcps-{name}-env-"))
+    )
+    if not known:
+        fail(f"no server named '{name}'. See: mcps ls")
+    podman.destroy(name)
+    if not keep_image:
+        podman.run("rmi", "-f", f"localhost/mcps-{name}:latest", check=False)
+    podman.secret_rm(podman.secret_name(name, "token"))
+    for secret in podman.secret_names(f"mcps-{name}-env-"):
+        podman.secret_rm(secret)
+    meta_path(name).unlink(missing_ok=True)
+    source_dir = config.SRC_DIR / name
+    if source_dir.exists():
+        detect.force_rmtree(source_dir)
+    console.print(f"[green]+[/green] removed {name}")
+
+
+@app.command()
+def logs(
+    name: str = typer.Argument(..., help="Server name."),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Stream new output."),
+    tailscale: bool = typer.Option(False, "--tailscale", help="Show the tailscale sidecar instead."),
+) -> None:
+    """Show a server's logs."""
+    if not podman.pod_exists(name):
+        fail(f"no server named '{name}'. See: mcps ls")
+    container = f"{podman.pod_name(name)}-{'ts' if tailscale else 'app'}"
+    follow_args = ["-f"] if follow else []
+    raise typer.Exit(podman.stream("logs", *follow_args, "--tail", "200", container))
+
+
+@app.command()
+def restart(name: str = typer.Argument(..., help="Server name.")) -> None:
+    """Restart a server."""
+    if not podman.pod_exists(name):
+        fail(f"no server named '{name}'. See: mcps ls")
+    pod = podman.pod_name(name)
+    podman.run("pod", "restart", pod)
+    dns_name, ip = wait_online(f"{pod}-ts")
+
+    meta = read_meta(name)
+    url = server_url(config.load(), name, dns_name)
+    if url != meta.get("url"):
+        meta.update({"url": url, "ip": ip})
+        write_meta(name, meta)
+
+    console.print(f"[green]+[/green] {name} is back")
+    show_endpoint(
+        name, url, meta.get("public_url", ""),
+        podman.secret_get(podman.secret_name(name, "token")),
+        bool(meta.get("public")), f"{pod}-ts", meta.get("allow_cidrs", ""),
+    )
+
+
+@app.command()
+def token(
+    name: str = typer.Argument(..., help="Server name."),
+    rotate: bool = typer.Option(False, "--rotate", help="Replace the token with a fresh one."),
+) -> None:
+    """Show, or rotate, a public server's bearer token."""
+    if not podman.pod_exists(name):
+        fail(f"no server named '{name}'. See: mcps ls")
+    secret = podman.secret_name(name, "token")
+    if rotate:
+        fresh = secrets.token_urlsafe(32)
+        podman.secret_set(secret, fresh)
+        meta = read_meta(name)
+        meta["token_fingerprint"] = token_fingerprint(fresh)
+        write_meta(name, meta)
+        console.print("[green]+[/green] rotated. Restart to apply it: mcps restart " + name)
+        console.print(f"  token: [bold]{fresh}[/bold]")
+        return
+
+    current = podman.secret_get(secret)
+    if not current:
+        fail(f"{name} has no token - it is a tailnet-only server. Re-add it with --public to get one.")
+    console.print(current)
+
+
+secrets_app = typer.Typer(no_args_is_help=True, help="Manage a server's environment secrets.")
+app.add_typer(secrets_app, name="secrets")
+
+
+def require_server(name: str) -> dict:
+    if not (podman.pod_exists(name) or meta_path(name).exists()):
+        fail(f"no server named '{name}'. See: mcps ls")
+    return read_meta(name)
+
+
+@secrets_app.command("add")
+def secrets_add(
+    server: str = typer.Argument(..., help="Server the variable belongs to."),
+    name: str = typer.Option(..., "--name", "-n", help="Variable name, e.g. BRING_PASSWORD."),
+    value: str = typer.Option("", "--value", "-v", help="Value. Omit it to be prompted instead, which keeps it out of your shell history."),
+    stdin: bool = typer.Option(False, "--stdin", help="Read the value from stdin, e.g. from a password manager."),
+) -> None:
+    """Add or replace one environment secret. Works before the server exists."""
+    if name in RESERVED_ENV:
+        fail(f"{name} is set by mcps itself. See: mcps token {server}")
+    meta = read_meta(server)
+    if stdin:
+        value = sys.stdin.read().strip()
+    elif not value:
+        value = typer.prompt(f"Value for {name}", hide_input=True)
+    if not value:
+        fail("no value given.")
+
+    podman.secret_set(podman.env_secret_name(server, name), value)
+    meta.setdefault("name", server)
+    meta["env_keys"] = sorted(set(meta.get("env_keys", [])) | {name})
+    write_meta(server, meta)
+
+    if podman.pod_exists(server):
+        restart_app(server)
+        console.print(f"[green]+[/green] {name} set on {server}, container recreated")
+    else:
+        console.print(f"[green]+[/green] {name} stored for {server}")
+        console.print(f"  It is picked up when you create it: mcps add <target> --name {server}")
+
+
+@secrets_app.command("ls")
+def secrets_ls(server: str = typer.Argument(..., help="Server name.")) -> None:
+    """List a server's environment secrets. Names only - values are never printed."""
+    meta = require_server(server)
+    keys = [k for k in meta.get("env_keys", []) if podman.secret_get(podman.env_secret_name(server, k))]
+    if not keys:
+        console.print(f"{server} has no environment secrets. Add one: mcps secrets add {server} --name KEY")
+        return
+    for key in keys:
+        console.print(f"{key}  [dim]{podman.env_secret_name(server, key)}[/dim]")
+
+
+@secrets_app.command("rm")
+def secrets_rm(
+    server: str = typer.Argument(..., help="Server name."),
+    name: str = typer.Option(..., "--name", "-n", help="Variable name to remove."),
+) -> None:
+    """Remove one environment secret, then restart the server."""
+    meta = require_server(server)
+    if name not in meta.get("env_keys", []):
+        fail(f"{server} has no secret named {name}. See: mcps secrets ls {server}")
+
+    podman.secret_rm(podman.env_secret_name(server, name))
+    meta["env_keys"] = [k for k in meta["env_keys"] if k != name]
+    write_meta(server, meta)
+
+    if podman.pod_exists(server):
+        restart_app(server)
+    console.print(f"[green]+[/green] {name} removed from {server}")
+
+
+@app.command()
+def autostart(
+    enable: bool = typer.Option(None, "--enable/--disable", help="Turn boot persistence on or off. Omit to show the current state."),
+) -> None:
+    """Bring your servers back after a reboot. Off unless you turn it on."""
+    try:
+        podman.preflight()
+    except podman.PodmanError as exc:
+        fail(str(exc))
+
+    if enable is None:
+        for label, on in (("containers", boot.containers_enabled()), ("podman machine", boot.machine_enabled())):
+            mark, colour = ("+", "green") if on else ("-", "yellow")
+            console.print(f"[{colour}]{mark}[/{colour}] {label}: {'starts at boot' if on else 'does not start at boot'}")
+        if not (boot.containers_enabled() and boot.machine_enabled()):
+            console.print("\n  Turn it on with: mcps autostart --enable")
+        return
+
+    try:
+        boot.set_containers(enable)
+        note = boot.set_machine(enable)
+    except (subprocess.CalledProcessError, podman.PodmanError) as exc:
+        fail(f"could not change autostart: {exc}")
+
+    word = "enabled" if enable else "disabled"
+    console.print(f"[green]+[/green] autostart {word}")
+    console.print(f"  containers: podman-restart.service {word} inside the machine")
+    if note:
+        console.print(f"  machine: {'wrote' if enable else 'removed'} {note}")
+
+
+@app.command()
+def doctor() -> None:
+    """Check that everything this tool needs is in place."""
+    ok = True
+
+    def line(label: str, good: bool, detail: str) -> None:
+        nonlocal ok
+        ok = ok and good
+        mark = "+" if good else "x"
+        colour = "green" if good else "red"
+        console.print(f"[{colour}]{mark}[/{colour}] {label}: {detail}")
+
+    line("git", shutil.which("git") is not None, shutil.which("git") or "not on PATH")
+    try:
+        podman.preflight()
+        line("podman", True, podman.run("version", "--format", "{{.Client.Version}}"))
+    except podman.PodmanError as exc:
+        line("podman", False, str(exc).splitlines()[0])
+    suffix = tailnet.magic_dns_suffix()
+    line("tailscale", suffix is not None, suffix or "host client not running (only needed for nicer URLs)")
+    cfg = config.load()
+    migrate_authkey(cfg)
+    stored = bool(read_authkey())
+    line("auth key", stored, f"podman secret {config.AUTHKEY_SECRET}" if stored else "missing - run: mcps init")
+    raise typer.Exit(0 if ok else 1)
