@@ -4,6 +4,7 @@
 // Both are what make `mcps add --public` safe: a Funnel URL is public and guessable.
 const http = require("node:http");
 const crypto = require("node:crypto");
+const net = require("node:net");
 const { spawn } = require("node:child_process");
 
 const TOKEN = process.env.MCP_TOKEN || "";
@@ -12,6 +13,15 @@ const TOKEN = process.env.MCP_TOKEN || "";
 const SILENT = process.env.MCP_SILENT === "1";
 const UPSTREAM = 8081;
 const PORT = Number(process.env.MCP_PORT || 8080);
+if (process.env.MCP_REQUIRE_TOKEN === "1" && !TOKEN) {
+  throw new Error("MCP_TOKEN is required for a public server");
+}
+
+// The hosted process needs its own API keys, not the gateway's credentials.
+const childEnv = { ...process.env };
+for (const key of ["MCP_TOKEN", "MCP_REQUIRE_TOKEN", "MCP_ALLOW_CIDRS", "MCP_SILENT"]) {
+  delete childEnv[key];
+}
 
 const child = spawn(
   "supergateway",
@@ -22,15 +32,25 @@ const child = spawn(
     "--streamableHttpPath", "/mcp",
     "--healthEndpoint", "/healthz",
     "--stateful",
-    "--cors",
+    "--sessionTimeout", "600000",
+    "--logLevel", "none",
   ],
-  { stdio: "inherit" },
+  { stdio: "inherit", env: childEnv },
 );
+child.on("error", () => { console.error("[mcps] bridge failed to start"); process.exit(1); });
 child.on("exit", (code) => process.exit(code === null ? 1 : code));
 
 // --- source IP allowlist ---------------------------------------------------
 
 function ipToBigInt(ip) {
+  if (!net.isIP(ip)) return null;
+  // Convert an embedded IPv4 suffix to two IPv6 groups before expanding ::.
+  if (ip.includes(":") && ip.includes(".")) {
+    const split = ip.lastIndexOf(":");
+    const octets = ip.slice(split + 1).split(".").map(Number);
+    ip = ip.slice(0, split + 1) + ((octets[0] << 8) | octets[1]).toString(16) +
+      ":" + ((octets[2] << 8) | octets[3]).toString(16);
+  }
   if (ip.includes(":")) {
     const [head, tail] = ip.split("::");
     const left = head ? head.split(":") : [];
@@ -47,11 +67,16 @@ function ipToBigInt(ip) {
 }
 
 function parseCidr(entry) {
+  if (entry.split("/").length > 2) throw new Error("Invalid MCP_ALLOW_CIDRS");
   const [addr, bitsRaw] = entry.split("/");
   const value = ipToBigInt(addr);
-  if (value === null) return null;
+  if (value === null) throw new Error("Invalid MCP_ALLOW_CIDRS address");
   const width = addr.includes(":") ? 128 : 32;
   const bits = bitsRaw === undefined ? width : Number(bitsRaw);
+  if ((bitsRaw !== undefined && !/^\d+$/.test(bitsRaw)) ||
+      !Number.isInteger(bits) || bits < 0 || bits > width) {
+    throw new Error("Invalid MCP_ALLOW_CIDRS prefix");
+  }
   const mask = ((1n << BigInt(bits)) - 1n) << BigInt(width - bits);
   return { network: value & mask, mask, width };
 }
@@ -60,8 +85,7 @@ const ALLOW = (process.env.MCP_ALLOW_CIDRS || "")
   .split(",")
   .map((entry) => entry.trim())
   .filter(Boolean)
-  .map(parseCidr)
-  .filter(Boolean);
+  .map(parseCidr);
 
 function normalise(ip) {
   return (ip || "").replace(/^::ffff:/, "").replace(/^\[|\]$/g, "").split("%")[0];
@@ -98,14 +122,11 @@ function constantEquals(a, b) {
 // Returns the upstream path, or null when the request is not authorised.
 function authorise(req) {
   if (!TOKEN) return req.url;
+  const match = /^\/mcp\/([^/?]+)(.*)$/.exec(req.url);
+  if (match && constantEquals(match[1], TOKEN)) return `/mcp${match[2]}`;
   const header = req.headers.authorization || "";
   if (header.startsWith("Bearer ") && constantEquals(header.slice(7), TOKEN)) {
     return req.url;
-  }
-  // Token-in-path, for clients with no way to set a header.
-  const prefix = `/mcp/${TOKEN}`;
-  if (req.url === prefix || req.url.startsWith(`${prefix}/`) || req.url.startsWith(`${prefix}?`)) {
-    return `/mcp${req.url.slice(prefix.length)}`;
   }
   return null;
 }
@@ -116,27 +137,16 @@ http
   .createServer((req, res) => {
     const source = clientIp(req);
     if (!allowed(source)) {
-      // Logged in full so `mcps logs <name>` answers "what address did it arrive from?"
-      console.log(
-        `[mcps] blocked ${req.method} ${req.url} from ${source} ` +
-          `(allowed: ${process.env.MCP_ALLOW_CIDRS}, xff: ${req.headers["x-forwarded-for"] || "none"})`,
-      );
+      // URLs and forwarding headers can contain credentials or attacker input.
+      console.log(`[mcps] blocked request from ${net.isIP(source) ? source : "invalid address"}`);
       res.writeHead(403, { "Content-Type": "text/plain" });
-      res.end(`forbidden: ${source} is not in this server's allowlist\n`);
-      return;
-    }
-
-    // Past the allowlist, so this never answers an unauthorised public caller.
-    // Liveness from inside the pod goes to the bridge's own /healthz on 8081.
-    if (req.url === "/healthz") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("ok");
+      res.end("forbidden\n");
       return;
     }
 
     const path = authorise(req);
     if (path === null) {
-      console.log(`[mcps] rejected ${req.method} ${req.url} from ${source}: bad or missing token`);
+      console.log("[mcps] rejected request: bad or missing token");
       if (SILENT) {
         req.socket.destroy();
         return;
@@ -152,6 +162,11 @@ http
     const headers = { ...req.headers };
     delete headers.host;
     delete headers.connection;
+    delete headers.authorization;
+    delete headers.cookie;
+    // Never forward hop-by-hop headers, including headers named by Connection.
+    for (const key of (req.headers.connection || "").split(",")) delete headers[key.trim().toLowerCase()];
+    for (const key of ["proxy-authorization", "proxy-authenticate", "keep-alive", "upgrade", "te", "trailer", "transfer-encoding"]) delete headers[key];
 
     const upstream = http.request(
       { host: "127.0.0.1", port: UPSTREAM, method: req.method, path, headers },
@@ -167,7 +182,7 @@ http
     });
     req.pipe(upstream);
   })
-  .listen(PORT, "0.0.0.0", () => {
+  .listen(PORT, "127.0.0.1", () => {
     console.log(
       `[mcps] gateway on ${PORT} -> supergateway ${UPSTREAM}` +
         `${TOKEN ? " (bearer required)" : ""}` +

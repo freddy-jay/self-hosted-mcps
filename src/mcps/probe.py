@@ -22,20 +22,47 @@ class ProbeError(RuntimeError):
     pass
 
 
-def _parse(body: str) -> str:
-    payload = body
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Even a 302 can copy Authorization to a different origin.
+        return None
+
+
+def _open(request, timeout):
+    return urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout)
+
+
+def _post(url: str, payload: dict, headers: dict[str, str], timeout: int = 25):
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), headers=headers, method="POST"
+    )
+    return _open(request, timeout)
+
+
+def _payload(body: str) -> dict:
+    text = body
     for line in body.splitlines():
         if line.startswith("data:"):
-            payload = line[5:].strip()
+            text = line[5:].strip()
             break
     try:
-        data = json.loads(payload)
+        data = json.loads(text)
     except json.JSONDecodeError:
-        raise ProbeError(f"unexpected reply: {body[:200]}") from None
+        raise ProbeError("unexpected non-JSON reply") from None
+    if not isinstance(data, dict):
+        raise ProbeError("expected a JSON-RPC object")
+    return data
+
+
+def _parse(body: str) -> str:
+    data = _payload(body)
     if "error" in data:
-        raise ProbeError(str(data["error"].get("message", data["error"])))
-    info = (data.get("result") or {}).get("serverInfo") or {}
-    return " ".join(filter(None, [info.get("name", "server"), info.get("version", "")]))
+        raise ProbeError("MCP initialize returned an error; inspect the server logs")
+    result = data.get("result")
+    info = result.get("serverInfo") if isinstance(result, dict) else None
+    if data.get("id") != 1 or not isinstance(info, dict) or not isinstance(info.get("name"), str):
+        raise ProbeError("invalid MCP initialize result")
+    return " ".join(str(value) for value in [info["name"], info.get("version", "")] if value)
 
 
 def initialize(url: str, token: str = "", attempts: int = 12, gap: float = 5.0) -> str:
@@ -55,8 +82,14 @@ def initialize(url: str, token: str = "", attempts: int = 12, gap: float = 5.0) 
     )
     for attempt in range(attempts):
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                return _parse(response.read().decode("utf-8", "replace"))
+            with _open(request, timeout=20) as response:
+                name = _parse(response.read().decode("utf-8", "replace"))
+                session = response.headers.get("mcp-session-id", "")
+            # initialize is answered by the bridge itself, so it succeeds even
+            # when the MCP process died on startup - a missing API key being the
+            # usual cause. Listing tools is the first call that needs the child.
+            _list_tools(url, headers, session)
+            return name
         except urllib.error.HTTPError as exc:
             last = f"HTTP {exc.code} {exc.reason}"
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -90,3 +123,24 @@ def resolves_publicly(hostname: str) -> bool | None:
         if answer.get("Answer"):
             return True
     return False
+
+
+def _list_tools(url: str, headers: dict[str, str], session: str) -> None:
+    """Raise ProbeError unless the MCP process itself answers."""
+    call_headers = dict(headers)
+    if session:
+        call_headers["mcp-session-id"] = session
+    try:
+        _post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, call_headers).close()
+        with _post(url, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, call_headers) as response:
+            body = _payload(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        raise ProbeError(f"listing tools failed: HTTP {exc.code} {exc.reason}") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise ProbeError(f"listing tools failed: {getattr(exc, 'reason', exc)}") from None
+
+    if "error" in body:
+        raise ProbeError("the server accepted a connection but its tools are unavailable; inspect the server logs")
+    result = body.get("result")
+    if body.get("id") != 2 or not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+        raise ProbeError("invalid MCP tools/list result")

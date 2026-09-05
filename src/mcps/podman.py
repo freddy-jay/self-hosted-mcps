@@ -7,9 +7,10 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from . import validation
 
 RUNTIME = Path(__file__).parent / "runtime"
-BASE_IMAGE = os.environ.get("MCPS_BASE_IMAGE", "localhost/mcps-base:1")
+BASE_IMAGE = os.environ.get("MCPS_BASE_IMAGE", "localhost/mcps-base:2")
 TS_IMAGE = os.environ.get("MCPS_TS_IMAGE", "docker.io/tailscale/tailscale:latest")
 POD_PREFIX = "mcps-"
 
@@ -50,10 +51,12 @@ def image_exists(ref: str) -> bool:
 def ensure_base_image(rebuild: bool = False) -> None:
     if image_exists(BASE_IMAGE) and not rebuild:
         return
-    stream("build", "-t", BASE_IMAGE, "-f", str(RUNTIME / "base.Containerfile"), str(RUNTIME))
+    if stream("build", "-t", BASE_IMAGE, "-f", str(RUNTIME / "base.Containerfile"), str(RUNTIME)) != 0:
+        raise PodmanError("shared runtime image build failed")
 
 
 def pod_name(name: str) -> str:
+    validation.server_name(name)
     return f"{POD_PREFIX}{name}"
 
 
@@ -90,6 +93,7 @@ def write_serve_config(volume: str, serve_json: str) -> None:
 
 
 def secret_name(server: str, kind: str) -> str:
+    validation.server_name(server)
     return f"mcps-{server}-{kind}"
 
 
@@ -130,6 +134,8 @@ def cli_path() -> str:
 
 
 def env_secret_name(server: str, key: str) -> str:
+    validation.server_name(server)
+    validation.env_name(key)
     slug = re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-")
     return f"mcps-{server}-env-{slug}"
 
