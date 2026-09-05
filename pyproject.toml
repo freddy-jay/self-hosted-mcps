@@ -3,7 +3,7 @@ name = "mcps"
 version = "0.1.0"
 description = "Self-host any MCP server in a Podman pod on your tailnet"
 requires-python = ">=3.11"
-dependencies = ["typer>=0.12", "rich>=15.0.0"]
+dependencies = ["typer>=0.27.2", "rich>=15.0.0"]
 
 [project.scripts]
 mcps = "mcps.cli:app"
