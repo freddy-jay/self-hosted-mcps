@@ -20,7 +20,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.11'
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
       - run: python -m pip install --upgrade pip "setuptools>=83.0.0"
@@ -42,7 +42,7 @@ jobs:
       - run: python -m pip install --upgrade pip "setuptools>=83.0.0"
       - run: python -m pip install -e . pip-audit
       - run: python -m pip_audit --skip-editable
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
       - run: npm audit --prefix src/mcps/runtime --omit=dev
