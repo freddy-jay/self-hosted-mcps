@@ -9,3 +9,5 @@ build/
 .env
 config.json
 .mcps/
+.audit/
+NUL

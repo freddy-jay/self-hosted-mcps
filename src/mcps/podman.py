@@ -7,9 +7,10 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from . import validation
 
 RUNTIME = Path(__file__).parent / "runtime"
-BASE_IMAGE = os.environ.get("MCPS_BASE_IMAGE", "localhost/mcps-base:1")
+BASE_IMAGE = os.environ.get("MCPS_BASE_IMAGE", "localhost/mcps-base:2")
 TS_IMAGE = os.environ.get("MCPS_TS_IMAGE", "docker.io/tailscale/tailscale:latest")
 POD_PREFIX = "mcps-"
 
@@ -50,10 +51,12 @@ def image_exists(ref: str) -> bool:
 def ensure_base_image(rebuild: bool = False) -> None:
     if image_exists(BASE_IMAGE) and not rebuild:
         return
-    stream("build", "-t", BASE_IMAGE, "-f", str(RUNTIME / "base.Containerfile"), str(RUNTIME))
+    if stream("build", "-t", BASE_IMAGE, "-f", str(RUNTIME / "base.Containerfile"), str(RUNTIME)) != 0:
+        raise PodmanError("shared runtime image build failed")
 
 
 def pod_name(name: str) -> str:
+    validation.server_name(name)
     return f"{POD_PREFIX}{name}"
 
 
@@ -71,10 +74,14 @@ def destroy(name: str) -> None:
     # Log out first so the control plane drops the node immediately. Without this
     # the old ephemeral node lingers, and the replacement takes the next free
     # hostname - mcp-<name>-1, then -2 - changing the URL on every rebuild.
-    subprocess.run(
-        ["podman", "exec", f"{pod_name(name)}-ts", "tailscale", "logout"],
-        capture_output=True, timeout=30,
-    )
+    try:
+        subprocess.run(
+            ["podman", "exec", f"{pod_name(name)}-ts", "tailscale", "logout"],
+            capture_output=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        # Best effort logout: an offline control plane must not prevent cleanup.
+        pass
     subprocess.run(["podman", "pod", "rm", "-f", pod_name(name)], capture_output=True)
     subprocess.run(["podman", "volume", "rm", "-f", f"mcps-ts-{name}"], capture_output=True)
 
@@ -90,6 +97,7 @@ def write_serve_config(volume: str, serve_json: str) -> None:
 
 
 def secret_name(server: str, kind: str) -> str:
+    validation.server_name(server)
     return f"mcps-{server}-{kind}"
 
 
@@ -130,6 +138,8 @@ def cli_path() -> str:
 
 
 def env_secret_name(server: str, key: str) -> str:
+    validation.server_name(server)
+    validation.env_name(key)
     slug = re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-")
     return f"mcps-{server}-env-{slug}"
 

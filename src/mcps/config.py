@@ -13,6 +13,7 @@ from pathlib import Path
 HOME = Path(os.environ.get("MCPS_HOME") or (Path.home() / ".mcps"))
 CONFIG_PATH = HOME / "config.json"
 SRC_DIR = HOME / "src"
+ALLOWLIST_PATH = HOME / "allowlist.txt"
 
 AUTHKEY_SECRET = "mcps-authkey"
 

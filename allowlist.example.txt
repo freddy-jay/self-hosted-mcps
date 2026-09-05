@@ -1,0 +1,7 @@
+# Optional source-IP allowlist. No provider or account-specific IPs are built in.
+# Copy to ~/.mcps/allowlist.txt, or pass --allow-file PATH when adding a server.
+# One IP or CIDR per line; blank lines and # comments are ignored.
+# A blank file adds no IP restriction. Bearer authentication stays required.
+# Example documentation ranges below are commented out; replace with your IPs.
+# 192.0.2.4/32
+# 2001:db8::/64
