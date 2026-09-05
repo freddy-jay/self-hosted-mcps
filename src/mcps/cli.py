@@ -32,6 +32,14 @@ def fail(message: str) -> None:
     raise typer.Exit(1)
 
 
+def server_argument(value: str) -> str:
+    """Report invalid names as normal CLI usage errors, before accessing Podman."""
+    try:
+        return validation.server_name(value)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+
 def meta_path(name: str) -> Path:
     validation.server_name(name)
     return META_DIR / f"{name}.json"
@@ -305,12 +313,12 @@ def add(
     subdir: str = typer.Option("", "--subdir", help="Path inside the repo, for monorepos."),
     env: list[str] = typer.Option([], "--env", "-e", help="Environment variable KEY=VALUE, repeatable."),
     env_file: Path = typer.Option(None, "--env-file", exists=True, help="File of KEY=VALUE lines."),
-    public: bool = typer.Option(False, "--public", help="Expose via Tailscale Funnel with bearer authentication. Needed for hosted clients such as the OpenAI Responses API."),
-    silent: bool = typer.Option(False, "--silent", help="Drop unauthorised requests without a reply, instead of answering 401."),
-    new_token: bool = typer.Option(False, "--new-token", help="Rotate the bearer token instead of keeping the existing one."),
-    token_stdin: bool = typer.Option(False, "--token-stdin", help="Read the bearer token from stdin, e.g. from a password manager."),
-    allow: list[str] = typer.Option([], "--allow", help="Optional source CIDR, repeatable. No IP restriction by default; 'any' disables the check."),
-    rebuild_base: bool = typer.Option(False, "--rebuild-base", help="Rebuild the shared runtime image."),
+    public: bool = typer.Option(False, "--public", help="Allow hosted clients such as the OpenAI API and claude.ai. A token is generated automatically."),
+    silent: bool = typer.Option(False, "--silent", rich_help_panel="Advanced", help="Drop unauthorised requests without a reply, instead of answering 401."),
+    new_token: bool = typer.Option(False, "--new-token", rich_help_panel="Advanced", help="Rotate the bearer token instead of keeping the existing one."),
+    token_stdin: bool = typer.Option(False, "--token-stdin", rich_help_panel="Advanced", help="Read the bearer token from stdin, e.g. from a password manager."),
+    allow: list[str] = typer.Option([], "--allow", rich_help_panel="Advanced", help="Restrict source IPs (CIDR); repeatable. Usually unnecessary."),
+    rebuild_base: bool = typer.Option(False, "--rebuild-base", rich_help_panel="Advanced", help="Rebuild the shared runtime image."),
     force: bool = typer.Option(False, "--force", "-f", help="Replace an existing server with this name."),
 ) -> None:
     """Build an MCP server and put it on your tailnet."""
@@ -500,7 +508,7 @@ def show_endpoint(
     if not public:
         console.print(f"\n  on your tailnet:  [bold]{url}[/bold]")
         console.print(f"  claude mcp add --transport http {name} {url}")
-        console.print(f"  OpenAI Codex config: mcps client {name} --client codex")
+        console.print(f"  OpenAI Codex config: mcps client {name}")
         console.print("\n  Any device on your tailnet can reach it, Claude Code and Claude Desktop included.")
         console.print("  claude.ai runs off your tailnet - re-run with --public to add a Funnel endpoint.")
         console.print(json.dumps({"mcpServers": {name: {"type": "http", "url": url}}}, indent=2))
@@ -518,7 +526,7 @@ def show_endpoint(
     console.print(f"\n  on the public internet, with the bearer token:")
     console.print(f"    [bold]{url}[/bold]")
     console.print(f"  Retrieve your credential explicitly: mcps token {name}")
-    console.print(f"  OpenAI Codex config: mcps client {name} --client codex")
+    console.print(f"  OpenAI Codex config: mcps client {name}")
     console.print(f"  OpenAI Responses API example: mcps client {name} --client openai")
     console.print(
         "\n  For claude.ai: add a custom connector on the public URL. Paste the bearer token into\n"
@@ -554,7 +562,7 @@ def list_servers() -> None:
 
 @app.command("rm")
 def remove(
-    name: str = typer.Argument(..., help="Server name."),
+    name: str = typer.Argument(..., callback=server_argument, help="Server name."),
     keep_image: bool = typer.Option(False, "--keep-image", help="Leave the built image on disk."),
 ) -> None:
     """Remove a server, its tailnet node and its data."""
@@ -581,7 +589,7 @@ def remove(
 
 @app.command()
 def logs(
-    name: str = typer.Argument(..., help="Server name."),
+    name: str = typer.Argument(..., callback=server_argument, help="Server name."),
     follow: bool = typer.Option(False, "--follow", "-f", help="Stream new output."),
     tailscale: bool = typer.Option(False, "--tailscale", help="Show the tailscale sidecar instead."),
 ) -> None:
@@ -594,7 +602,7 @@ def logs(
 
 
 @app.command()
-def restart(name: str = typer.Argument(..., help="Server name.")) -> None:
+def restart(name: str = typer.Argument(..., callback=server_argument, help="Server name.")) -> None:
     """Restart a server."""
     if not podman.pod_exists(name):
         fail(f"no server named '{name}'. See: mcps ls")
@@ -618,7 +626,7 @@ def restart(name: str = typer.Argument(..., help="Server name.")) -> None:
 
 @app.command()
 def token(
-    name: str = typer.Argument(..., help="Server name."),
+    name: str = typer.Argument(..., callback=server_argument, help="Server name."),
     rotate: bool = typer.Option(False, "--rotate", help="Replace the token with a fresh one."),
 ) -> None:
     """Show, or rotate, a public server's bearer token."""
@@ -655,10 +663,10 @@ def require_server(name: str) -> dict:
 
 @app.command("client")
 def client_config(
-    name: str = typer.Argument(..., help="Server name."),
-    client: str = typer.Option("codex", "--client", help="codex (TOML) or openai (Responses API Python example)."),
+    name: str = typer.Argument(..., callback=server_argument, help="Server name."),
+    client: str = typer.Option("codex", "--client", help="codex (default) or openai (API example)."),
 ) -> None:
-    """Print client setup without reading or embedding bearer tokens."""
+    """Get client setup. Run: mcps client NAME (Codex) or add --client openai."""
     from .clients import render
     meta = require_server(name)
     try:
@@ -669,7 +677,7 @@ def client_config(
 
 @secrets_app.command("add")
 def secrets_add(
-    server: str = typer.Argument(..., help="Server the variable belongs to."),
+    server: str = typer.Argument(..., callback=server_argument, help="Server the variable belongs to."),
     name: str = typer.Option(..., "--name", "-n", help="Variable name, e.g. BRING_PASSWORD."),
     value: str = typer.Option("", "--value", "-v", help="Value. Omit it to be prompted instead, which keeps it out of your shell history."),
     stdin: bool = typer.Option(False, "--stdin", help="Read the value from stdin, e.g. from a password manager."),
@@ -699,7 +707,7 @@ def secrets_add(
 
 
 @secrets_app.command("ls")
-def secrets_ls(server: str = typer.Argument(..., help="Server name.")) -> None:
+def secrets_ls(server: str = typer.Argument(..., callback=server_argument, help="Server name.")) -> None:
     """List a server's environment secrets. Names only - values are never printed."""
     meta = require_server(server)
     keys = [k for k in meta.get("env_keys", []) if podman.secret_get(podman.env_secret_name(server, k))]
@@ -712,7 +720,7 @@ def secrets_ls(server: str = typer.Argument(..., help="Server name.")) -> None:
 
 @secrets_app.command("rm")
 def secrets_rm(
-    server: str = typer.Argument(..., help="Server name."),
+    server: str = typer.Argument(..., callback=server_argument, help="Server name."),
     name: str = typer.Option(..., "--name", "-n", help="Variable name to remove."),
 ) -> None:
     """Remove one environment secret, then restart the server."""

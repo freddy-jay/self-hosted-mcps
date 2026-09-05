@@ -3,24 +3,42 @@
 Self-host any MCP server. Give it a GitHub link; it builds a Podman pod with a
 Tailscale sidecar and hands you an HTTPS URL.
 
-```
-mcps add modelcontextprotocol/servers --subdir src/filesystem --name fs
--> https://mcp-fs.your-tailnet.ts.net/mcp
-```
+## Quick start
 
-## Install
+Install and configure once (Podman must be running):
 
-```
+```sh
 uv tool install .
-mcps init          # paste a Tailscale auth key
-mcps doctor        # confirms podman, git, tailscale, key
+mcps init
 ```
 
-Podman must be running (`podman machine start` on Windows/macOS).
+`init` asks for your Tailscale auth key. Create a reusable, ephemeral,
+pre-approved key in [Tailscale settings](https://login.tailscale.com/admin/settings/keys).
 
-The auth key needs to be **reusable**, **ephemeral** and **pre-approved**
-(tailscale.com/admin/settings/keys). Ephemeral means a removed server leaves no
-dead node behind.
+Add a server and get its client configuration:
+
+```sh
+mcps add pypi:mcp-server-time --name time
+mcps client time
+```
+
+`client` defaults to Codex. Copy its output into `~/.codex/config.toml`.
+For Claude Code, `add` also prints the connection command.
+
+Using the OpenAI API or another hosted client? Add `--public`:
+
+```sh
+mcps add pypi:mcp-server-time --name time --public
+mcps client time --client openai
+```
+
+The token is generated and stored automatically. Retrieve it with
+`mcps token time` when configuring the client. If `time` already exists,
+add `--force` to the `add` command to replace it.
+
+Everyday commands: `mcps ls`, `mcps logs time`, `mcps restart time`, `mcps rm time`.
+If setup fails, run `mcps doctor`. On Windows/macOS, start Podman with
+`podman machine start`.
 
 ## Commands
 
@@ -39,20 +57,19 @@ mcps doctor
 
 `<target>` is `owner/repo`, a full git URL, `npm:<package>` or `pypi:<package>`.
 
-Useful flags on `add`:
+Common flags on `add` (everything else has a default):
 
 | flag | why |
 | --- | --- |
 | `--public` | also publish it on the internet, for clients that aren't on your tailnet |
-| `--new-token` | rotate the bearer token; without it a rebuild keeps the existing one |
-| `--token-stdin` | read the token from stdin instead of generating one |
-| `--allow <cidr>` | who may reach a `--public` server; repeatable, `any` disables the check |
-| `--silent` | drop unauthorised requests with no reply at all, instead of answering 401 |
 | `--subdir src/foo` | monorepos — the whole repo stays the build context, so shared tsconfig/workspace files resolve |
 | `--cmd "node dist/x.js"` | the entrypoint guess was wrong |
 | `-e KEY=VALUE`, `--env-file` | API keys the server needs |
 | `--ref v1.2.0` | pin a branch or tag |
 | `--name` | the tailnet hostname becomes `mcp-<name>` |
+
+For optional token, IP and runtime controls, see `mcps add --help` under
+**Advanced**. You do not need them for normal setup.
 
 ## Which clients can reach it
 
@@ -86,7 +103,7 @@ host) and prints the policy snippet you need at login.tailscale.com/admin/acls:
 Print a configuration entry without retrieving or embedding credentials:
 
 ```sh
-mcps client time --client codex
+mcps client time
 ```
 
 Add its output to your Codex configuration (`~/.codex/config.toml`). For a public
@@ -323,7 +340,8 @@ TLS-only.
 Read [SECURITY.md](SECURITY.md) for the trust model, reporting and upgrade steps.
 Server names use lowercase letters, digits and hyphens (maximum 59 characters).
 The `env` name segment is reserved to prevent collisions with environment-secret
-IDs; Windows device names are also rejected. Older servers using reserved names
+IDs; Windows device names are also rejected. Automatically generated server
+names handle these restrictions for you. Older servers using reserved names
 need an explicit rename/recreation before management with this release.
 Environment names must be valid identifiers; names that map to the same Podman
 secret (such as `FOO_BAR` and `FOO__BAR`) cannot be combined.

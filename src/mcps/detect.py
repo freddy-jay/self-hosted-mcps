@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 import shlex
@@ -56,7 +57,17 @@ def default_name(target: str) -> str:
     else:
         stem = re.sub(r"\.git$", "", target.rstrip("/")).rsplit("/", 1)[-1]
     slug = re.sub(r"[^a-z0-9-]+", "-", stem.lower()).strip("-")
-    return slug or "mcp"
+    slug = slug or "mcp"
+    if len(slug) > 59:
+        slug = slug[:40].rstrip("-") + "-" + hashlib.sha256(slug.encode()).hexdigest()[:8]
+    slug = "-".join("environment" if part == "env" else part for part in slug.split("-"))
+    # A repo name should never force the user to learn reserved-name rules.
+    if len(slug) > 59:
+        slug = "mcp-" + hashlib.sha256(slug.encode()).hexdigest()[:12]
+    try:
+        return validation.server_name(slug)
+    except ValueError:
+        return validation.server_name(slug + "-mcp")
 
 
 def fetch(target: str, name: str, ref: str | None = None, subdir: str | None = None) -> Source:

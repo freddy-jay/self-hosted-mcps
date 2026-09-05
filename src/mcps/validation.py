@@ -5,11 +5,11 @@ from pathlib import Path
 
 def server_name(name: str) -> str:
     if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?", name):
-        raise ValueError("server name must be 1-59 lowercase letters, digits or hyphens, starting and ending with a letter or digit")
+        raise ValueError("use a name like 'my-server': lowercase letters, digits and hyphens, up to 59 characters")
     if name.upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
-        raise ValueError("server name is reserved by Windows")
+        raise ValueError(f"'{name}' is reserved by Windows; use '{name}-mcp' instead")
     if "env" in name.split("-"):
-        raise ValueError("server names cannot contain an 'env' segment: it is reserved for environment secrets")
+        raise ValueError("'env' is reserved in server names; use 'environment' instead")
     return name
 
 
@@ -28,10 +28,16 @@ def source_path(root: Path, name: str) -> Path:
 
 
 def workdir(value: str) -> str:
+    value = value.replace("\\", "/")
+    if value.startswith("/"):
+        raise ValueError("use a folder inside the repository, for example --subdir src/server")
+    while value.startswith("./"):
+        value = value[2:]
+    value = value.rstrip("/") or "."
     if value == ".":
         return value
     if not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", value) or ".." in value.split("/"):
-        raise ValueError("--subdir must be a relative directory inside the repository")
+        raise ValueError("use a folder inside the repository, for example --subdir src/server")
     return value
 
 
