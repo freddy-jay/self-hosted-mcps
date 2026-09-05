@@ -1,7 +1,6 @@
 """mcps - self-host any MCP server in a Podman pod, reachable only over your tailnet."""
 from __future__ import annotations
 
-import ipaddress
 import json
 import re
 import os
@@ -18,7 +17,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import autostart as boot
-from . import config, detect, podman, probe, tailnet, validation
+from . import access, config, detect, podman, probe, tailnet, validation
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help=__doc__)
 console = Console()
@@ -102,11 +101,6 @@ def funnel_active(ts_container: str) -> bool:
     return result.returncode == 0 and "Funnel on" in result.stdout
 
 
-# Anthropic's published outbound range - the addresses their MCP calls come from.
-# https://platform.claude.com/docs/en/api/ip-addresses  (override with MCPS_ANTHROPIC_CIDRS)
-ANTHROPIC_CIDRS = os.environ.get("MCPS_ANTHROPIC_CIDRS", "160.79.104.0/21")
-
-
 def read_authkey() -> str:
     return podman.secret_get(config.AUTHKEY_SECRET)
 
@@ -141,9 +135,13 @@ def local_healthy(app_container: str) -> bool:
     return probe_run.returncode == 0
 
 
-def report_broken(name: str, url: str, reason: str, local_ok: bool) -> None:
+def report_broken(name: str, url: str, reason: probe.ProbeError, local_ok: bool, allow_cidrs: str = "") -> None:
     err.print(f"[red]x[/red] {name} started but did not answer an MCP handshake: {reason}")
-    if local_ok:
+    if allow_cidrs and reason.status_code == 403:
+        err.print("  The IP allowlist blocked this machine's setup check.")
+        err.print("  Check the source address in the gateway logs and update your allowlist file.")
+        err.print("  Re-run add with --force to apply it. No extra IP ranges are allowed automatically.")
+    elif local_ok:
         err.print(f"  The server is up inside the pod, so the tailnet leg failed for {url}.")
         err.print("  HTTPS certificates are a separate toggle from MagicDNS in the Tailscale admin panel.")
         err.print(f"  Enable them, or fall back to plain HTTP: mcps init --http && mcps add ... --force")
@@ -152,9 +150,6 @@ def report_broken(name: str, url: str, reason: str, local_ok: bool) -> None:
         err.print(f"  See: mcps logs {name}")
         err.print(f"  Then re-run add with -e KEY=VALUE or --cmd, plus --force.")
     err.print(f"  The pod is left running so you can inspect it. Remove it with: mcps rm {name}")
-
-
-DNS_LAG = "getaddrinfo failed"
 
 
 # The gateway owns these; letting a user secret target one would collide with it.
@@ -318,6 +313,7 @@ def add(
     new_token: bool = typer.Option(False, "--new-token", rich_help_panel="Advanced", help="Rotate the bearer token instead of keeping the existing one."),
     token_stdin: bool = typer.Option(False, "--token-stdin", rich_help_panel="Advanced", help="Read the bearer token from stdin, e.g. from a password manager."),
     allow: list[str] = typer.Option([], "--allow", rich_help_panel="Advanced", help="Restrict source IPs (CIDR); repeatable. Usually unnecessary."),
+    allow_file: Path = typer.Option(None, "--allow-file", exists=True, dir_okay=False, rich_help_panel="Advanced", help="IP list file. Defaults to ~/.mcps/allowlist.txt if present."),
     rebuild_base: bool = typer.Option(False, "--rebuild-base", rich_help_panel="Advanced", help="Rebuild the shared runtime image."),
     force: bool = typer.Option(False, "--force", "-f", help="Replace an existing server with this name."),
 ) -> None:
@@ -359,21 +355,16 @@ def add(
         if not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", token):
             fail("bearer token must contain 32-256 URL-safe letters, digits, underscores or hyphens")
 
-    # Off by default: Tailscale Funnel does not hand the backend the real client
-    # address, so an IP allowlist there blocks everything, Anthropic included.
-    # Opt in with --allow only where a genuine client IP reaches the gateway.
+    # Opt in only where the proxy supplies a trustworthy source address.
     allow_cidrs = ""
-    if public and allow:
-        chosen = allow
-        if any(c.strip().lower() == "any" for c in chosen) and len(chosen) != 1:
-            fail("--allow any must be used alone")
-        if "any" not in [c.strip().lower() for c in chosen]:
-            for entry in chosen:
-                try:
-                    ipaddress.ip_network(entry.strip(), strict=False)
-                except ValueError:
-                    fail(f"--allow expects a CIDR or 'any', got: {entry}")
-            allow_cidrs = ",".join(c.strip() for c in chosen)
+    if allow_file and allow:
+        fail("use --allow-file or --allow, not both")
+    if public:
+        policy_path = allow_file or (config.ALLOWLIST_PATH if config.ALLOWLIST_PATH.exists() else None)
+        try:
+            allow_cidrs = access.resolve(allow, policy_path)
+        except (ValueError, OSError) as exc:
+            fail(str(exc))
 
     pairs: dict[str, str] = {}
     for item in env:
@@ -487,14 +478,14 @@ def add(
         # A newly registered node takes a while to reach this machine's MagicDNS
         # cache, and a tagged node stays invisible until an ACL grants access to
         # the tag. Both are local resolution problems, not a broken server.
-        if healthy and DNS_LAG in str(exc).lower():
+        if healthy and exc.dns_failure:
             err.print(f"[yellow]![/yellow] {url} does not resolve from this machine yet.")
             err.print("  The server answers inside the pod, so this is DNS on your side:")
             err.print("  a new node takes a moment, and a tagged node needs an ACL that grants")
             err.print(f"  access to its tag, e.g. {{\"action\": \"accept\", \"src\": [\"autogroup:member\"], \"dst\": [\"tag:mcp:*\"]}}")
             server_name = "not reachable from this machine yet"
         else:
-            report_broken(name, url, str(exc), healthy)
+            report_broken(name, url, exc, healthy, allow_cidrs)
             raise typer.Exit(1)
 
     console.print(f"\n[green]+[/green] [bold]{name}[/bold] is live ({server_name})")
@@ -633,10 +624,10 @@ def token(
     if not podman.pod_exists(name):
         fail(f"no server named '{name}'. See: mcps ls")
     secret = podman.secret_name(name, "token")
+    meta = read_meta(name)
+    if not meta.get("public"):
+        fail("this is a tailnet-only server; it does not use a bearer token")
     if rotate:
-        meta = read_meta(name)
-        if not meta.get("public"):
-            fail("tailnet-only servers have no gateway token; re-add with --public first")
         fresh = secrets.token_urlsafe(32)
         podman.secret_set(secret, fresh)
         meta["token_fingerprint"] = token_fingerprint(fresh)

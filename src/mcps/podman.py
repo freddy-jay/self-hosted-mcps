@@ -74,10 +74,14 @@ def destroy(name: str) -> None:
     # Log out first so the control plane drops the node immediately. Without this
     # the old ephemeral node lingers, and the replacement takes the next free
     # hostname - mcp-<name>-1, then -2 - changing the URL on every rebuild.
-    subprocess.run(
-        ["podman", "exec", f"{pod_name(name)}-ts", "tailscale", "logout"],
-        capture_output=True, timeout=30,
-    )
+    try:
+        subprocess.run(
+            ["podman", "exec", f"{pod_name(name)}-ts", "tailscale", "logout"],
+            capture_output=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        # Best effort logout: an offline control plane must not prevent cleanup.
+        pass
     subprocess.run(["podman", "pod", "rm", "-f", pod_name(name)], capture_output=True)
     subprocess.run(["podman", "volume", "rm", "-f", f"mcps-ts-{name}"], capture_output=True)
 

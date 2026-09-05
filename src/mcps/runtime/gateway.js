@@ -139,6 +139,7 @@ http
     if (!allowed(source)) {
       // URLs and forwarding headers can contain credentials or attacker input.
       console.log(`[mcps] blocked request from ${net.isIP(source) ? source : "invalid address"}`);
+      if (SILENT) { req.socket.destroy(); return; }
       res.writeHead(403, { "Content-Type": "text/plain" });
       res.end("forbidden\n");
       return;
@@ -180,6 +181,8 @@ http
       if (!res.headersSent) res.writeHead(502, { "Content-Type": "text/plain" });
       res.end("upstream unavailable");
     });
+    res.on("close", () => upstream.destroy());
+    req.on("aborted", () => upstream.destroy());
     req.pipe(upstream);
   })
   .listen(PORT, "127.0.0.1", () => {

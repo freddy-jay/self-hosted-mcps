@@ -14,7 +14,9 @@ function gateway(env = {}) {
     },
     request(options) {
       state.forwarded.push(options);
-      return new EventEmitter();
+      state.upstream = new EventEmitter();
+      state.upstream.destroy = () => { state.upstreamDestroyed = true; };
+      return state.upstream;
     },
   };
   const context = {
@@ -32,9 +34,10 @@ function gateway(env = {}) {
   };
   vm.runInNewContext(fs.readFileSync('src/mcps/runtime/gateway.js', 'utf8'), context);
   state.request = (url, headers = {}) => {
-    const res = { status: 0, writeHead(status) { this.status = status; }, end() {} };
+    const res = Object.assign(new EventEmitter(), { status: 0, writeHead(status) { this.status = status; }, end() {} });
+    state.response = res;
     state.handler({ url, method: 'POST', headers,
-      socket: { remoteAddress: '127.0.0.1', destroy() {} }, pipe() {}, on() {} }, res);
+      socket: { remoteAddress: '127.0.0.1', destroy() { state.socketDestroyed = true; } }, pipe() {}, on() {} }, res);
     return res.status;
   };
   return state;
@@ -44,6 +47,18 @@ test('invalid configured CIDRs fail closed at startup', () => {
   for (const cidr of ['garbage', '10.0.0.0/33', '::/129', '10.0.0.1/abc']) {
     assert.throws(() => gateway({ MCP_ALLOW_CIDRS: cidr }), undefined, cidr);
   }
+});
+
+test('silent mode also drops allowlist rejections', () => {
+  const g = gateway({ MCP_ALLOW_CIDRS: '192.0.2.0/24', MCP_SILENT: '1' });
+  assert.equal(g.request('/mcp'), 0);
+  assert.equal(g.socketDestroyed, true);
+});
+test('client disconnect destroys upstream connection', () => {
+  const g = gateway();
+  g.request('/mcp', { authorization: 'Bearer test-token' });
+  g.response.emit('close');
+  assert.equal(g.upstreamDestroyed, true);
 });
 test('malformed source cannot crash the gateway or match an allowlist', () => {
   const g = gateway({ MCP_ALLOW_CIDRS: '160.79.104.0/21' });

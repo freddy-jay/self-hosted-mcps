@@ -47,7 +47,7 @@ async function main() {
   delete headers.Authorization;
   const viaPath = await rpc({ jsonrpc: '2.0', id: 4, method: 'tools/list' }, `${url}/${token}`);
   assert.equal(viaPath.tools.length, 1);
-  console.log('Container smoke passed: auth, initialize, sessions, tools, URL fallback, credential isolation');
+  console.log('Container smoke passed: auth, initialize, sessions, tools, URL fallback, child environment scoping');
 }
 main().then(() => process.exitCode = 0, error => {
   console.error(error); process.exitCode = 1;

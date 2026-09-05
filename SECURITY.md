@@ -20,6 +20,9 @@ rotate upstream API keys at their provider.
 - Prefer Authorization headers. Token-in-path compatibility is supported, but
   URLs can leak into client history, proxy logs and screenshots. The gateway does
   not log request URLs or pass its authorization header to the MCP process.
+  The child environment omits the gateway token, but this is environment scoping,
+  not isolation from malicious server code: processes sharing a user may inspect
+  each other's environment through the operating system.
 - The optional IP allowlist is defense in depth, never user authentication.
   It is off by default because Funnel may not provide a trustworthy original
   source IP. Do not use crawler IP lists as MCP egress allowlists.

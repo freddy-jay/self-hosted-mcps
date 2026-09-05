@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -19,7 +20,10 @@ INITIALIZE = {
 
 
 class ProbeError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None, dns_failure: bool = False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.dns_failure = dns_failure
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -67,7 +71,7 @@ def _parse(body: str) -> str:
 
 def initialize(url: str, token: str = "", attempts: int = 12, gap: float = 5.0) -> str:
     """Return the server's self-reported name, or raise ProbeError."""
-    last = "no response"
+    last = ProbeError("no response")
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -91,14 +95,17 @@ def initialize(url: str, token: str = "", attempts: int = 12, gap: float = 5.0) 
             _list_tools(url, headers, session)
             return name
         except urllib.error.HTTPError as exc:
-            last = f"HTTP {exc.code} {exc.reason}"
+            last = ProbeError(f"HTTP {exc.code} {exc.reason}", status_code=exc.code)
+            if exc.code in (401, 403):
+                raise last from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            last = str(getattr(exc, "reason", exc))
+            reason = getattr(exc, "reason", exc)
+            last = ProbeError(str(reason), dns_failure=isinstance(reason, socket.gaierror))
         except ProbeError as exc:
-            last = str(exc)
+            last = exc
         if attempt < attempts - 1:
             time.sleep(gap)
-    raise ProbeError(last)
+    raise last
 
 
 def resolves_publicly(hostname: str) -> bool | None:
@@ -135,9 +142,10 @@ def _list_tools(url: str, headers: dict[str, str], session: str) -> None:
         with _post(url, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, call_headers) as response:
             body = _payload(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        raise ProbeError(f"listing tools failed: HTTP {exc.code} {exc.reason}") from None
+        raise ProbeError(f"listing tools failed: HTTP {exc.code} {exc.reason}", status_code=exc.code) from None
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise ProbeError(f"listing tools failed: {getattr(exc, 'reason', exc)}") from None
+        reason = getattr(exc, 'reason', exc)
+        raise ProbeError(f"listing tools failed: {reason}", dns_failure=isinstance(reason, socket.gaierror)) from None
 
     if "error" in body:
         raise ProbeError("the server accepted a connection but its tools are unavailable; inspect the server logs")

@@ -218,11 +218,19 @@ use bearer authentication without a provider-specific IP restriction. Opt in
 only if your reverse proxy supplies a trustworthy original client address:
 
 ```
-mcps add owner/repo --public --allow 192.0.2.4/32
+mcps add owner/repo --public --allow-file ./allowlist.txt
 ```
 
-`--allow` accepts IPv4 and IPv6 CIDRs and may be repeated. `--allow any` must be
-used alone. Invalid ranges fail closed. The gateway accepts a forwarded address
+Copy `allowlist.example.txt` to `~/.mcps/allowlist.txt` (or `$MCPS_HOME/allowlist.txt`)
+to use it automatically for new public servers. Put one IPv4/IPv6 address or CIDR
+per line; blank lines and `#` comments are ignored. The example contains no active
+ranges. Edit the file and rerun `mcps add` with `--force` to update an existing
+server; running servers keep their saved policy until rebuilt.
+
+For a one-off override, `--allow` accepts addresses or CIDRs and may be repeated.
+`--allow any` disables the file policy for that server and must be used alone.
+Use either `--allow-file` or `--allow`. Missing explicit files and invalid ranges
+fail closed; an empty file adds no IP restriction. The gateway accepts a forwarded address
 only from a loopback peer and uses the rightmost `X-Forwarded-For` entry. It binds
 only to loopback inside the pod. Funnel may not expose the original source IP;
 if it does not, an allowlist will block legitimate requests too.
