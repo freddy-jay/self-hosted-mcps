@@ -16,8 +16,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import autostart as boot
-from . import access, config, detect, podman, probe, tailnet, validation
+from mcps import autostart as boot
+from mcps import access, config, detect, podman, probe, tailnet, tunnels, validation
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help=__doc__)
 console = Console()
@@ -302,14 +302,15 @@ def init(
 @app.command()
 def add(
     target: str = typer.Argument(..., help="GitHub URL or owner/repo, or npm:<pkg>, or pypi:<pkg>."),
+    *,
     name: str = typer.Option("", "--name", "-n", help="Name on your tailnet (default: repo name)."),
     cmd: str = typer.Option("", "--cmd", help="Override the stdio command the server is started with."),
     ref: str = typer.Option("", "--ref", help="Git branch or tag."),
     subdir: str = typer.Option("", "--subdir", help="Path inside the repo, for monorepos."),
     env: list[str] = typer.Option([], "--env", "-e", help="Environment variable KEY=VALUE, repeatable."),
     env_file: Path = typer.Option(None, "--env-file", exists=True, help="File of KEY=VALUE lines."),
-    public: bool = typer.Option(False, "--public", help="Allow hosted clients such as the OpenAI API and claude.ai. A token is generated automatically."),
-    silent: bool = typer.Option(False, "--silent", rich_help_panel="Advanced", help="Drop unauthorised requests without a reply, instead of answering 401."),
+    public: bool | None = typer.Option(None, "--public/--private", help="Public HTTPS or tailnet-only access. Rebuilds preserve existing access when omitted."),
+    silent: bool | None = typer.Option(None, "--silent/--no-silent", rich_help_panel="Advanced", help="Drop unauthorised requests instead of answering 401. Rebuilds preserve this setting when omitted."),
     new_token: bool = typer.Option(False, "--new-token", rich_help_panel="Advanced", help="Rotate the bearer token instead of keeping the existing one."),
     token_stdin: bool = typer.Option(False, "--token-stdin", rich_help_panel="Advanced", help="Read the bearer token from stdin, e.g. from a password manager."),
     allow: list[str] = typer.Option([], "--allow", rich_help_panel="Advanced", help="Restrict source IPs (CIDR); repeatable. Usually unnecessary."),
@@ -327,8 +328,6 @@ def add(
     migrate_authkey(cfg)
     if not read_authkey():
         fail("no Tailscale auth key yet. Run: mcps init")
-    if public and not cfg["https"]:
-        fail("--public needs HTTPS: Funnel is TLS-only on port 443. Run: mcps init --https")
 
     name = name or detect.default_name(target)
     try:
@@ -338,6 +337,10 @@ def add(
     except ValueError as exc:
         fail(str(exc))
     previous = read_meta(name)
+    public = bool(previous.get("public")) if public is None else public
+    silent = bool(previous.get("silent")) if silent is None else silent
+    if public and not cfg["https"]:
+        fail("--public needs HTTPS: Funnel is TLS-only on port 443. Run: mcps init --https")
     exists = podman.pod_exists(name)
     if exists and not force:
         fail(f"'{name}' already exists. Use --force to replace it, or mcps rm {name}.")
@@ -362,7 +365,10 @@ def add(
     if public:
         policy_path = allow_file or (config.ALLOWLIST_PATH if config.ALLOWLIST_PATH.exists() else None)
         try:
-            allow_cidrs = access.resolve(allow, policy_path)
+            if not allow and allow_file is None and "allow_cidrs" in previous:
+                allow_cidrs = access.resolve(previous["allow_cidrs"].split(","), None)
+            else:
+                allow_cidrs = access.resolve(allow, policy_path)
         except (ValueError, OSError) as exc:
             fail(str(exc))
 
@@ -450,6 +456,8 @@ def add(
             *app_args(name, env_keys, bool(token), allow_cidrs, silent),
             image,
         )
+        if previous.get("tunnel_id"):
+            tunnels.start(name, tunnel_id=previous["tunnel_id"], image=previous["tunnel_image"])
     except podman.PodmanError as exc:
         podman.destroy(name)
         fail(str(exc))
@@ -468,6 +476,7 @@ def add(
         "url": url, "ip": ip, "image": image, "public": public,
         "token_fingerprint": token_fingerprint(token) if token else "",
         "allow_cidrs": allow_cidrs, "env_keys": env_keys, "silent": silent,
+        **{k: previous[k] for k in ("tunnel_id", "tunnel_image") if k in previous},
     })
 
     console.print("[cyan]->[/cyan] handshaking with the server")
@@ -488,6 +497,8 @@ def add(
             report_broken(name, url, exc, healthy, allow_cidrs)
             raise typer.Exit(1)
 
+    if previous.get("tunnel_id") and not tunnels.wait_ready(name):
+        fail(f"MCP server is running, but its OpenAI tunnel is not ready. See: mcps logs {name} --tunnel")
     console.print(f"\n[green]+[/green] [bold]{name}[/bold] is live ({server_name})")
     show_endpoint(name, url, exposed, token, public, ts_container, allow_cidrs)
 
@@ -569,6 +580,7 @@ def remove(
     if not keep_image:
         podman.run("rmi", "-f", f"localhost/mcps-{name}:latest", check=False)
     podman.secret_rm(podman.secret_name(name, "token"))
+    podman.secret_rm(podman.secret_name(name, "openai-key"))
     for secret in podman.secret_names(f"mcps-{name}-env-"):
         podman.secret_rm(secret)
     meta_path(name).unlink(missing_ok=True)
@@ -581,13 +593,17 @@ def remove(
 @app.command()
 def logs(
     name: str = typer.Argument(..., callback=server_argument, help="Server name."),
+    *,
     follow: bool = typer.Option(False, "--follow", "-f", help="Stream new output."),
     tailscale: bool = typer.Option(False, "--tailscale", help="Show the tailscale sidecar instead."),
+    tunnel: bool = typer.Option(False, "--tunnel", help="Show the OpenAI tunnel sidecar instead."),
 ) -> None:
     """Show a server's logs."""
     if not podman.pod_exists(name):
         fail(f"no server named '{name}'. See: mcps ls")
-    container = f"{podman.pod_name(name)}-{'ts' if tailscale else 'app'}"
+    if tailscale and tunnel:
+        fail("use --tailscale or --tunnel, not both")
+    container = f"{podman.pod_name(name)}-{'tunnel' if tunnel else 'ts' if tailscale else 'app'}"
     follow_args = ["-f"] if follow else []
     raise typer.Exit(podman.stream("logs", *follow_args, "--tail", "200", container))
 
@@ -607,6 +623,8 @@ def restart(name: str = typer.Argument(..., callback=server_argument, help="Serv
         meta.update({"url": url, "ip": ip})
         write_meta(name, meta)
 
+    if meta.get("tunnel_id") and not tunnels.wait_ready(name):
+        fail(f"MCP server restarted, but its OpenAI tunnel is not ready. See: mcps logs {name} --tunnel")
     console.print(f"[green]+[/green] {name} is back")
     show_endpoint(
         name, url, meta.get("public_url", ""),
@@ -663,6 +681,83 @@ def client_config(
     try:
         typer.echo(render(name, meta, client))
     except ValueError as exc:
+        fail(str(exc))
+
+
+@app.command("tunnel")
+def tunnel_setup(
+    name: str = typer.Argument(..., callback=server_argument, help="Server to connect privately to OpenAI."),
+    *,
+    tunnel_id: str = typer.Option("", "--tunnel-id", help="OpenAI tunnel ID. Omit for guided setup."),
+    key_stdin: bool = typer.Option(False, "--key-stdin", help="Read the runtime API key from stdin instead of a hidden prompt."),
+    status: bool = typer.Option(False, "--status", help="Check the existing tunnel's local readiness."),
+    remove: bool = typer.Option(False, "--remove", help="Remove the local sidecar and key; preserve existing access."),
+) -> None:
+    """Add OpenAI Secure MCP Tunnel without changing existing client access.
+
+    Setup preserves public Funnel and private Tailscale access. Create the tunnel in your
+    OpenAI organization and associate your ChatGPT workspace when prompted.
+    """
+    if (status and remove) or ((status or remove) and (tunnel_id or key_stdin)):
+        fail("use setup, --status, or --remove separately")
+    try:
+        podman.preflight()
+        meta = require_server(name)
+        if not podman.pod_exists(name):
+            fail("start or rebuild this server before configuring its tunnel")
+        if remove:
+            tunnels.remove(name)
+            for key in ("tunnel_id", "tunnel_image"):
+                meta.pop(key, None)
+            write_meta(name, meta)
+            console.print("Removed the local tunnel. OpenAI tunnel records can be deleted at " + tunnels.SETTINGS_URL)
+            return
+        if status:
+            if not meta.get("tunnel_id"):
+                fail("no OpenAI tunnel configured; run mcps tunnel " + name)
+            typer.echo("Tunnel: " + meta["tunnel_id"])
+            if not tunnels.ready(name):
+                fail("tunnel is not locally ready; see mcps logs " + name + " --tunnel")
+            typer.echo("Tunnel ready; recent successful OpenAI poll verified. Confirm tool calls in your OpenAI client.")
+            return
+        if meta.get("tunnel_id"):
+            fail("a tunnel is already configured; use --status, or --remove before replacing it")
+        if not tunnel_id:
+            console.print("Create a tunnel and associate your Personal organization and target ChatGPT workspace:")
+            typer.echo(tunnels.SETTINGS_URL)
+            console.print("Tunnel managers need Read + Manage; the runtime key owner needs Read + Use.")
+            typer.launch(tunnels.SETTINGS_URL)
+            tunnel_id = typer.prompt("Tunnel ID").strip()
+        tunnels.validate_id(tunnel_id)
+        if key_stdin:
+            key = sys.stdin.read().strip()
+        else:
+            key = podman.secret_get(podman.secret_name(name, "openai-key"))
+            if not key:
+                console.print("Create a runtime API key (not an admin key); restrict it to Tunnels Read + Use:")
+                typer.echo(tunnels.KEYS_URL)
+                key = typer.prompt("Runtime API key (stored only as a Podman secret)", hide_input=True).strip()
+        if not key or any(c.isspace() for c in key):
+            fail("a non-empty runtime API key without whitespace is required")
+        console.print("Downloading and pinning the official OpenAI tunnel image...")
+        image = tunnels.pull_image()
+        podman.secret_set(podman.secret_name(name, "openai-key"), key)
+        del key
+        meta.update(tunnel_id=tunnel_id, tunnel_image=image)
+        tunnels.start(name, tunnel_id=tunnel_id, image=image)
+        # Save immediately so interrupted setup can be inspected or removed.
+        write_meta(name, meta)
+        console.print("Checking readiness and waiting for a successful OpenAI poll...")
+        if not tunnels.wait_ready(name):
+            fail("tunnel not ready; public/Tailscale settings are unchanged. See mcps logs " + name + " --tunnel, then --remove to retry")
+        # Adding a client transport must not remove another client's transport.
+        # The tunnel uses pod loopback independently of Tailscale/Funnel routing.
+        console.print("OpenAI tunnel configured. Existing Tailscale/Funnel access and authentication are unchanged.")
+        typer.echo("Tailscale: " + meta.get("url", ""))
+        typer.echo("OpenAI tunnel: " + tunnel_id)
+        console.print("In ChatGPT, create a developer-mode app, choose Tunnel, and select this tunnel.")
+        console.print("Readiness and OpenAI polling passed; verify a tool call from your OpenAI client.")
+    except (podman.PodmanError, ValueError) as exc:
         fail(str(exc))
 
 

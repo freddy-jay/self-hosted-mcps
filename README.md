@@ -25,7 +25,18 @@ mcps client time
 `client` defaults to Codex. Copy its output into `~/.codex/config.toml`.
 For Claude Code, `add` also prints the connection command.
 
-Using the OpenAI API or another hosted client? Add `--public`:
+For private access from hosted OpenAI clients, keep Tailscale and add an
+OpenAI Secure MCP Tunnel:
+
+```sh
+mcps tunnel time
+```
+
+The guided setup opens OpenAI tunnel settings, explains the required workspace
+association, asks for the tunnel ID and a hidden runtime API key, and starts an
+outbound tunnel sidecar. See **Private OpenAI access** below.
+
+For clients that need a public HTTPS endpoint, add `--public`:
 
 ```sh
 mcps add pypi:mcp-server-time --name time --public
@@ -49,6 +60,7 @@ mcps logs <name>    server output (--tailscale for the sidecar, -f to follow)
 mcps restart <name>
 mcps token <name>   show the bearer token (--rotate replaces and applies it)
 mcps client <name>  print OpenAI Codex config (--client openai for Responses API)
+mcps tunnel <name>  guided private OpenAI tunnel setup (keeps Tailscale access)
 mcps secrets        add / ls / rm a server's environment secrets
 mcps autostart      bring servers back after a reboot (--enable / --disable)
 mcps rm <name>      pod, tailnet node, image, secret, sources
@@ -75,8 +87,8 @@ For optional token, IP and runtime controls, see `mcps add --help` under
 
 By default a server is **tailnet-only**. Local clients such as OpenAI Codex,
 Claude Code and Claude Desktop can reach it from a device on your tailnet.
-Hosted clients such as the OpenAI Responses API and claude.ai need public
-reachability. For those, use `--public`:
+Hosted OpenAI clients can use Secure MCP Tunnel for private access. Hosted clients
+using a direct HTTPS URL need public reachability; for that path, use `--public`:
 
 ```
 mcps add pypi:mcp-server-time --name time --public
@@ -123,6 +135,58 @@ codex
 Restart a desktop client from an environment containing the variable if needed.
 The generated TOML never stores the credential. See the official
 [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+
+### Private OpenAI access
+
+```sh
+mcps tunnel time
+mcps tunnel time --status
+mcps logs time --tunnel
+```
+
+`mcps tunnel` adds the official OpenAI `tunnel-client` container to the existing
+pod. Local clients keep using the private Tailscale URL. OpenAI reaches the same
+MCP bridge through the sidecar's outbound HTTPS connection. No new ports are
+published; its health listener stays on pod loopback at port 8082.
+
+The wizard opens [OpenAI tunnel settings](https://platform.openai.com/settings/organization/tunnels).
+Create a tunnel associated with your Platform organization and the ChatGPT
+workspace that will use it. Create a runtime API key restricted to **Tunnels Read
++ Use**; creating the tunnel itself requires **Read + Manage**. The CLI accepts
+the key through a hidden prompt or `--key-stdin`, stores it in a per-server Podman
+secret, and never saves it in server metadata. It reuses a stored key on retry.
+Use a runtime key, not an admin key. The same Podman at-rest limitations described
+below apply to this secret.
+
+If you already have the ID, use `mcps tunnel time --tunnel-id tunnel_...`.
+The first setup downloads the current stable official image and saves its immutable
+digest. Rebuilds reuse that image, tunnel ID, and runtime secret. Restart and
+autostart include the sidecar because it belongs to the same pod.
+
+Setup adds the OpenAI sidecar without changing existing access. Public servers
+keep Funnel, their URLs, bearer tokens, and IP policy so Anthropic and other
+clients keep working. Private servers stay private. Setup checks local readiness
+and a recent successful OpenAI poll without restarting Tailscale or the MCP app.
+If readiness fails, inspect `--tunnel` logs, then remove the sidecar and retry.
+A successful readiness check does not replace a tool-call test in the consuming
+OpenAI product.
+
+In ChatGPT developer mode, create an app, select **Tunnel**, and choose the
+configured tunnel. Local Codex can continue using `mcps client time` over Tailscale.
+The `--client openai` Python generator currently covers direct public endpoints;
+it does not generate tunnel-based Responses API configuration.
+
+`mcps tunnel time --remove` removes only the local sidecar and runtime secret.
+It preserves existing public/private access and does not delete the OpenAI tunnel
+record. `mcps rm time` also removes the sidecar and key. Funnel and the OpenAI
+tunnel can coexist, including after a rebuild. Rebuilding with `add --force`
+preserves public/private access, silent rejection, and the IP policy unless you
+explicitly override them. Use `--private` to intentionally remove public access,
+`--no-silent` to restore 401 responses, or `--allow any` to clear the IP policy.
+
+See [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
+for permissions, workspace associations, and supported products. Private tunnels
+do not support public plugin distribution.
 
 ### OpenAI Responses API
 
@@ -257,7 +321,7 @@ usable address, use `--allow any` and rely on the token.
 
 ## How it works
 
-One pod per server, two containers sharing a network namespace:
+One pod per server, with containers sharing a network namespace:
 
 - **tailscale** (userspace mode, no `/dev/net/tun` needed) joins your tailnet as
   `mcp-<name>` and serves HTTPS on 443 → `127.0.0.1:8081` for private
@@ -266,6 +330,8 @@ One pod per server, two containers sharing a network namespace:
   [supergateway](https://github.com/supercorp-ai/supergateway) on 8081 — which
   wraps the MCP server's stdio into streamable HTTP at `/mcp` — and fronts it
   with the allowlist and bearer checks, passing SSE straight through.
+- **tunnel** (optional) runs OpenAI's tunnel client, forwarding outbound tunnel
+  work to `127.0.0.1:8081/mcp`; local health and polling checks use port 8082.
 
 Traffic from your tailnet reaches 8081 directly, since Tailscale ACLs already
 gate it. Public mode sends all traffic through the gateway on 443, so it always requires
@@ -279,7 +345,8 @@ misses. Before reporting success it runs a real MCP `initialize` handshake
 against the published URL, so a server that started but can't answer — usually a
 missing API key — is reported as broken instead of live.
 
-Podman labels are the source of truth for what exists.
+Podman labels identify what exists; server metadata records current access and
+tunnel settings, including an in-place switch from public to private access.
 
 ## Access control on a shared tailnet
 
@@ -360,10 +427,30 @@ running containers still need rebuilding; use `--rebuild-base` when refreshing
 an explicitly configured runtime image.
 
 ```sh
-python -m pip install -e .
-python -m unittest discover -s tests -v
-node --test tests/gateway.test.js
+python -m pip install -e '.[dev]'
+make check
 ```
+
+Use a repository-local virtual environment for development. Keep the everyday
+`mcps` installation as a non-editable copy of a reviewed release or wheel; never
+replace it with an editable checkout or reinstall it as part of a test run.
+Editing files and running unit tests must not touch installed tools or running
+servers. Installing a new CLI version does not require rebuilding existing pods.
+
+The CLI entrypoint refuses to run from a source checkout except for help, unless
+`MCPS_ALLOW_LIVE_CHANGES=1` is explicitly set for that process. This is an accident
+guard, not a sandbox. Unit tests use temporary state and mocked Podman calls.
+For live integration tests, first select a disposable Podman machine/connection
+and a separate `MCPS_HOME`, then set the opt-in only in that test shell. A separate
+`MCPS_HOME` alone does **not** isolate Podman pods, secrets, volumes, or image tags.
+Never set the opt-in globally or use existing production servers as test fixtures.
+
+`make check` runs Ruff, strict mypy, pytest, and the gateway tests; CI runs the
+same command. Ruff and mypy currently cover the new tunnel/development modules
+and their tests. Legacy CLI/configuration modules still have untyped metadata
+and module-level state; this change does not claim repository-wide compliance
+with the Python guidelines. The automated rule mapping is in `pyproject.toml`.
+Without Make, run the commands in `Makefile` with your virtual environment's Python.
 
 CI runs these tests and a Python dependency vulnerability audit. Fork workflows
 require owner approval before execution. Hosted MCP packages and runtime image
