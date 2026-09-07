@@ -337,6 +337,17 @@ def add(
     except ValueError as exc:
         fail(str(exc))
     previous = read_meta(name)
+    if previous.get("tunnel_id"):
+        # Validate before fetching/building or removing the working pod.
+        saved_id = previous["tunnel_id"]
+        saved_image = previous.get("tunnel_image", "")
+        try:
+            if not isinstance(saved_id, str) or not isinstance(saved_image, str):
+                raise tunnels.TunnelConfigurationError("invalid saved tunnel configuration")
+            tunnels.validate_id(saved_id)
+            tunnels.validate_image(saved_image)
+        except tunnels.TunnelConfigurationError as exc:
+            fail(str(exc))
     public = bool(previous.get("public")) if public is None else public
     silent = bool(previous.get("silent")) if silent is None else silent
     if public and not cfg["https"]:
@@ -723,7 +734,7 @@ def tunnel_setup(
         if meta.get("tunnel_id"):
             fail("a tunnel is already configured; use --status, or --remove before replacing it")
         if not tunnel_id:
-            console.print("Create a tunnel and associate your Personal organization and target ChatGPT workspace:")
+            console.print("Create a tunnel and associate your Platform organization and target ChatGPT workspace:")
             typer.echo(tunnels.SETTINGS_URL)
             console.print("Tunnel managers need Read + Manage; the runtime key owner needs Read + Use.")
             typer.launch(tunnels.SETTINGS_URL)

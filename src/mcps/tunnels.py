@@ -11,12 +11,24 @@ KEYS_URL = "https://platform.openai.com/settings/organization/api-keys"
 IMAGE = "ghcr.io/openai/tunnel-client:latest"
 
 
+class TunnelConfigurationError(ValueError):
+    """Tunnel identity or image cannot safely be used to start a sidecar."""
+
+
 def validate_id(value: str) -> str:
     if not re.fullmatch(r"tunnel_[a-f0-9]{32}", value):
-        raise ValueError(
+        raise TunnelConfigurationError(
             "invalid tunnel ID; copy the tunnel_... value from OpenAI tunnel settings"
         )
     return value
+
+
+def validate_image(image: str) -> str:
+    if not re.fullmatch(r"ghcr.io/openai/tunnel-client@sha256:[a-f0-9]{64}", image):
+        raise TunnelConfigurationError(
+            "invalid saved tunnel image digest; run mcps tunnel again"
+        )
+    return image
 
 
 def pull_image() -> str:
@@ -25,14 +37,13 @@ def pull_image() -> str:
         "image", "inspect", IMAGE, "--format", "{{index .RepoDigests 0}}"
     )
     if not re.fullmatch(r"ghcr.io/openai/tunnel-client@sha256:[a-f0-9]{64}", digest):
-        raise ValueError("could not pin the official tunnel image digest")
+        raise TunnelConfigurationError("could not pin the official tunnel image digest")
     return digest
 
 
 def start(name: str, *, tunnel_id: str, image: str) -> None:
     identity = validate_id(tunnel_id)
-    if not re.fullmatch(r"ghcr.io/openai/tunnel-client@sha256:[a-f0-9]{64}", image):
-        raise ValueError("invalid saved tunnel image digest; run mcps tunnel again")
+    validate_image(image)
     pod = podman.pod_name(name)
     podman.run(
         "run",

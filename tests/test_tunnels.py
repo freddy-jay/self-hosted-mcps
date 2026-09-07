@@ -11,6 +11,35 @@ from mcps import cli, config, detect, podman, probe, tunnels
 
 
 class TunnelTests(unittest.TestCase):
+    def test_invalid_saved_tunnel_stops_rebuild_before_fetch(self) -> None:
+        previous = cli.read_meta("safe")
+        for saved in (
+            {"tunnel_id": "invalid", "tunnel_image": "invalid"},
+            {"tunnel_id": "tunnel_" + "a" * 32},
+            {"tunnel_id": "tunnel_" + "a" * 32, "tunnel_image": "invalid"},
+            {"tunnel_id": "tunnel_" + "a" * 32, "tunnel_image": None},
+        ):
+            with self.subTest(saved=saved):
+                cli.write_meta("safe", {**previous, **saved})
+                with (
+                    patch.object(podman, "preflight"),
+                    patch.object(cli, "migrate_authkey"),
+                    patch.object(cli, "read_authkey", return_value="fake-key"),
+                    patch.object(config, "load", return_value={"https": True}),
+                    patch.object(podman, "pod_exists", return_value=True),
+                    patch.object(podman, "secret_get", return_value="t" * 43),
+                    patch.object(
+                        detect, "fetch", side_effect=AssertionError("must not fetch")
+                    ) as fetch,
+                    patch.object(podman, "destroy") as destroy,
+                ):
+                    result = CliRunner().invoke(
+                        cli.app, ["add", "pypi:example", "--name", "safe", "--force"]
+                    )
+                self.assertNotEqual(result.exit_code, 0)
+                fetch.assert_not_called()
+                destroy.assert_not_called()
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -231,16 +260,32 @@ class TunnelTests(unittest.TestCase):
 
     def test_rebuild_preserves_public_access_and_tunnel(self) -> None:
         previous = cli.read_meta("safe")
-        previous.update(tunnel_id="tunnel_" + "a" * 32, tunnel_image="digest")
+        previous.update(
+            tunnel_id="tunnel_" + "a" * 32,
+            tunnel_image="ghcr.io/openai/tunnel-client@sha256:" + "a" * 64,
+        )
         cli.write_meta("safe", previous)
-        for flags, public, policy, silent in (
-            ([], True, previous["allow_cidrs"], True),
-            (["--public"], True, previous["allow_cidrs"], True),
-            (["--private"], False, "", True),
-            (["--allow", "any", "--no-silent"], True, "", False),
+        for flags, public, policy, silent, stored_policy in (
+            ([], True, previous["allow_cidrs"], True, previous["allow_cidrs"]),
+            (
+                ["--public"],
+                True,
+                previous["allow_cidrs"],
+                True,
+                previous["allow_cidrs"],
+            ),
+            (["--private"], False, "", True, previous["allow_cidrs"]),
+            (
+                ["--allow", "any", "--no-silent"],
+                True,
+                "",
+                False,
+                previous["allow_cidrs"],
+            ),
+            ([], True, "", True, ""),
         ):
             with self.subTest(flags=flags):
-                cli.write_meta("safe", previous)
+                cli.write_meta("safe", dict(previous, allow_cidrs=stored_policy))
                 with ExitStack() as stack:
                     for obj, attr, value in (
                         (podman, "preflight", None),
