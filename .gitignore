@@ -3,6 +3,9 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
 
 # never commit anything that could carry a key or a tailnet name
 *.env

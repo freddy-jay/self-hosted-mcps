@@ -2,7 +2,7 @@
 import json
 from urllib.parse import urlsplit
 
-from .validation import server_name
+from mcps.validation import server_name
 
 
 def render(name: str, meta: dict, client: str) -> str:
@@ -20,7 +20,7 @@ def render(name: str, meta: dict, client: str) -> str:
         return "\n".join(lines)
     if client == "openai":
         if not public or parsed.scheme != "https":
-            raise ValueError("OpenAI hosted MCP calls need a public HTTPS endpoint; re-add with --public")
+            raise ValueError("this direct-URL API example needs --public; for private OpenAI access use mcps tunnel NAME and the Secure MCP Tunnel guide")
         tool = {"type": "mcp", "server_label": name.replace("-", "_"),
                 "server_url": url, "require_approval": "always"}
         payload = json.dumps(tool, indent=4)
