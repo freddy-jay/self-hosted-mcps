@@ -383,8 +383,10 @@ class CompanionCliTests(unittest.TestCase):
     def test_companion_that_exited_is_reported_instead_of_live(self) -> None:
         ran = self.add("--force", "--companion", IMAGE, running=False)
         self.assertNotEqual(ran.result.exit_code, 0)
-        self.assertIn("mcps logs safe --companion", ran.result.output)
-        self.assertNotIn("is live", ran.result.output)
+        # Rich wraps the message at the terminal width, which differs in CI.
+        output = " ".join(ran.result.output.split())
+        self.assertIn("mcps logs safe --companion", output)
+        self.assertNotIn("is live", output)
         self.assertEqual(ran.events, ["destroy"])
 
     def test_rm_deletes_companion_volumes_found_by_label(self) -> None:
