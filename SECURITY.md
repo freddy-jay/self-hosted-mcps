@@ -51,7 +51,7 @@ allowlist settings. Rotation recreates the app container and interrupts sessions
 The bridge and its transitive npm dependencies are locked; `qs` is overridden to
 6.16.0 to fix the vulnerable range reported by npm audit. Bridge traffic logging
 is disabled to avoid persisting tool arguments/results; idle sessions expire
-after ten minutes. OS images, uv and third-party server dependencies
+after a day. OS images, uv and third-party server dependencies
 still require regular updates and scanning; pin image digests in deployments
 that need reproducibility. A passed test suite is not a security certification.
 
