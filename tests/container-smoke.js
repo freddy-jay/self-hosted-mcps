@@ -51,10 +51,12 @@ async function main() {
   const live = headers['mcp-session-id'];
 
   // A client that hangs up before its answer is ready must not take the bridge,
-  // and with it every other session, down.
+  // and with it every other session, down. The response headers arrive at once,
+  // so the hang-up happens while the body is still being awaited.
   await assert.rejects(fetch(url, { method: 'POST', headers, signal: AbortSignal.timeout(200),
     body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/call',
-      params: { name: 'environment_check', arguments: { delay_ms: 1500 } } }) }));
+      params: { name: 'environment_check', arguments: { delay_ms: 1500 } } }) })
+    .then(response => response.text()), { name: 'TimeoutError' });
   await delay(2500);
   assert.equal(gateway.exitCode, null, 'gateway and bridge survived a dropped client');
   const survived = await rpc({ jsonrpc: '2.0', id: 6, method: 'tools/list' });
