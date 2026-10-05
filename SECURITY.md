@@ -32,6 +32,14 @@ rotate upstream API keys at their provider.
 - Server code shares a pod network namespace with Tailscale. Capability dropping
   and `no-new-privileges` reduce risk, but this is not a hostile multi-tenant
   sandbox. This project does not enforce outbound-network or per-tool policy.
+- A companion image runs in that same namespace with `no-new-privileges` but
+  with Podman's default capabilities. It can reach the ungated bridge on pod
+  loopback, so trust it as much as the server code. Tailscale's userspace mode
+  forwards a tailnet connection on any port to the same port on pod loopback,
+  so every port a companion listens on is reachable from the tailnet devices
+  your ACLs allow, with no authentication from this project. Funnel never
+  carries those ports. Use the companion's own login, or grant only port 443
+  on these nodes in your ACLs.
 
 ## Maintenance and upgrades
 
