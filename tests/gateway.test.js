@@ -98,3 +98,8 @@ test('the trusted rightmost address wins; gateway binds only loopback', () => {
   assert.equal(g.forwarded.length, 1);
   assert.equal(g.host, '127.0.0.1');
 });
+test('idle sessions are kept for a day, set explicitly rather than left to the bridge default', () => {
+  const args = gateway().child.args;
+  assert.ok(args.includes('--stateful'));
+  assert.equal(args[args.indexOf('--sessionTimeout') + 1], String(24 * 60 * 60 * 1000));
+});

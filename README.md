@@ -300,7 +300,19 @@ Use either `--allow-file` or `--allow`. Missing explicit files and invalid range
 fail closed; an empty file adds no IP restriction. The gateway accepts a forwarded address
 only from a loopback peer and uses the rightmost `X-Forwarded-For` entry. It binds
 only to loopback inside the pod. Funnel may not expose the original source IP;
-if it does not, an allowlist will block legitimate requests too.
+if it does not, an allowlist will block legitimate requests too. Tailscale
+1.102 was observed to pass it, in `X-Forwarded-For` beside a
+`Tailscale-Funnel-Request` header, but confirm it on your own setup first.
+
+To admit only one provider plus your own tailnet, rebuild a server that already
+works, giving the provider's published outbound range and the two Tailscale
+ranges. The first range below is a documentation placeholder; Anthropic
+publishes its real one at
+[IP addresses](https://platform.claude.com/docs/en/api/ip-addresses):
+
+```
+mcps add owner/repo --force --allow 192.0.2.0/24 --allow 100.64.0.0/10 --allow fd7a:115c:a1e0::/48
+```
 
 An IP allowlist does not identify your account. Provider ranges are shared by
 other users, and crawler ranges are not a substitute for verified MCP egress
@@ -377,7 +389,10 @@ One pod per server, with containers sharing a network namespace:
 - **app** runs a small node gateway on 8080 that spawns
   [supergateway](https://github.com/supercorp-ai/supergateway) on 8081 — which
   wraps the MCP server's stdio into streamable HTTP at `/mcp` — and fronts it
-  with the allowlist and bearer checks, passing SSE straight through.
+  with the allowlist and bearer checks, passing SSE straight through. Each MCP
+  session gets its own server process, reaped after a day without requests. The
+  bridge answers 404 for a session it no longer has, which is the MCP signal
+  for a client to start a new one.
 - **tunnel** (optional) runs OpenAI's tunnel client, forwarding outbound tunnel
   work to `127.0.0.1:8081/mcp`; local health and polling checks use port 8082.
 - **companion** (optional) runs an image you name with `--companion`, for a
@@ -452,7 +467,7 @@ overridable:
 | `MCPS_HOME` | `~/.mcps` — settings, server metadata and clones; no secrets |
 | `TS_AUTHKEY` | read by `mcps init` so the key can be set non-interactively |
 | `MCPS_TAILSCALE` | path to the host `tailscale` binary |
-| `MCPS_BASE_IMAGE` | `localhost/mcps-base:2` |
+| `MCPS_BASE_IMAGE` | `localhost/mcps-base:3` |
 | `MCPS_TS_IMAGE` | `docker.io/tailscale/tailscale:latest` |
 
 The runtime image takes `--build-arg NODE_IMAGE=...`. Bridge dependencies live in

@@ -13,6 +13,10 @@ const TOKEN = process.env.MCP_TOKEN || "";
 const SILENT = process.env.MCP_SILENT === "1";
 const UPSTREAM = 8081;
 const PORT = Number(process.env.MCP_PORT || 8080);
+// Each MCP session holds one server process. A hosted client keeps its session
+// ID while its user is away and fails the next call if the session is gone, so
+// an idle one is reaped after a day rather than minutes.
+const SESSION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 if (process.env.MCP_REQUIRE_TOKEN === "1" && !TOKEN) {
   throw new Error("MCP_TOKEN is required for a public server");
 }
@@ -32,7 +36,7 @@ const child = spawn(
     "--streamableHttpPath", "/mcp",
     "--healthEndpoint", "/healthz",
     "--stateful",
-    "--sessionTimeout", "600000",
+    "--sessionTimeout", String(SESSION_TIMEOUT_MS),
     "--logLevel", "none",
   ],
   { stdio: "inherit", env: childEnv },

@@ -17,5 +17,9 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       error: { code: -32601, message: 'Method not found' } }) + '\n');
     return;
   }
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n');
+  // delay_ms lets a test hang up before the answer is ready.
+  const delay = request.method === 'tools/call' ? Number(request.params?.arguments?.delay_ms || 0) : 0;
+  setTimeout(() => {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n');
+  }, delay);
 });
