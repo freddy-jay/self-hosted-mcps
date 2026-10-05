@@ -299,8 +299,19 @@ For a one-off override, `--allow` accepts addresses or CIDRs and may be repeated
 Use either `--allow-file` or `--allow`. Missing explicit files and invalid ranges
 fail closed; an empty file adds no IP restriction. The gateway accepts a forwarded address
 only from a loopback peer and uses the rightmost `X-Forwarded-For` entry. It binds
-only to loopback inside the pod. Funnel may not expose the original source IP;
-if it does not, an allowlist will block legitimate requests too.
+only to loopback inside the pod. With Tailscale 1.102, Funnel requests arrive
+with the caller's address in `X-Forwarded-For` and a `Tailscale-Funnel-Request`
+header, so an allowlist sees the real source; if a setup does not pass it on,
+an allowlist blocks legitimate requests too.
+
+To admit only one provider plus your own tailnet, list the provider's published
+outbound range and the two tailnet ranges. Anthropic publishes its range at
+[IP addresses](https://platform.claude.com/docs/en/api/ip-addresses); check
+that page rather than copying a range from here:
+
+```
+mcps add owner/repo --public --silent   --allow <provider outbound CIDR> --allow 100.64.0.0/10 --allow fd7a:115c:a1e0::/48
+```
 
 An IP allowlist does not identify your account. Provider ranges are shared by
 other users, and crawler ranges are not a substitute for verified MCP egress
@@ -377,7 +388,10 @@ One pod per server, with containers sharing a network namespace:
 - **app** runs a small node gateway on 8080 that spawns
   [supergateway](https://github.com/supercorp-ai/supergateway) on 8081 — which
   wraps the MCP server's stdio into streamable HTTP at `/mcp` — and fronts it
-  with the allowlist and bearer checks, passing SSE straight through.
+  with the allowlist and bearer checks, passing SSE straight through. Each MCP
+  session gets its own server process, reaped after a day without requests. A
+  request for a session the bridge no longer has is answered 404, which is the
+  MCP signal for a client to start a new session.
 - **tunnel** (optional) runs OpenAI's tunnel client, forwarding outbound tunnel
   work to `127.0.0.1:8081/mcp`; local health and polling checks use port 8082.
 - **companion** (optional) runs an image you name with `--companion`, for a

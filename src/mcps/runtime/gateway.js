@@ -4,7 +4,9 @@
 // Both are what make `mcps add --public` safe: a Funnel URL is public and guessable.
 const http = require("node:http");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
 const net = require("node:net");
+const nodePath = require("node:path");
 const { spawn } = require("node:child_process");
 
 const TOKEN = process.env.MCP_TOKEN || "";
@@ -12,6 +14,9 @@ const TOKEN = process.env.MCP_TOKEN || "";
 // scanner gets a reset rather than a 401 confirming something is listening.
 const SILENT = process.env.MCP_SILENT === "1";
 const UPSTREAM = 8081;
+// Each MCP session holds one server process. An idle one is reaped after a day:
+// ten minutes cut off clients that were merely waiting for the user to type.
+const SESSION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const PORT = Number(process.env.MCP_PORT || 8080);
 if (process.env.MCP_REQUIRE_TOKEN === "1" && !TOKEN) {
   throw new Error("MCP_TOKEN is required for a public server");
@@ -23,20 +28,32 @@ for (const key of ["MCP_TOKEN", "MCP_REQUIRE_TOKEN", "MCP_ALLOW_CIDRS", "MCP_SIL
   delete childEnv[key];
 }
 
-const child = spawn(
-  "supergateway",
-  [
-    "--stdio", process.env.MCP_CMD,
-    "--outputTransport", "streamableHttp",
-    "--port", String(UPSTREAM),
-    "--streamableHttpPath", "/mcp",
-    "--healthEndpoint", "/healthz",
-    "--stateful",
-    "--sessionTimeout", "600000",
-    "--logLevel", "none",
-  ],
-  { stdio: "inherit", env: childEnv },
-);
+const bridgeArgs = [
+  "--stdio", process.env.MCP_CMD,
+  "--outputTransport", "streamableHttp",
+  "--port", String(UPSTREAM),
+  "--streamableHttpPath", "/mcp",
+  "--healthEndpoint", "/healthz",
+  "--stateful",
+  "--sessionTimeout", String(SESSION_TIMEOUT_MS),
+  "--logLevel", "none",
+];
+
+function findOnPath(name) {
+  for (const dir of (process.env.PATH || "").split(nodePath.delimiter)) {
+    const candidate = nodePath.join(dir, name);
+    if (dir && fs.existsSync(candidate)) return fs.realpathSync(candidate);
+  }
+  return null;
+}
+
+// The bridge drops a rejected promise when a client hangs up before its answer
+// is ready, and node would exit on that, taking every session with it. The flag
+// goes on the bridge's own command line so the MCP server does not inherit it.
+const bridge = findOnPath("supergateway");
+const child = bridge
+  ? spawn(process.execPath, ["--unhandled-rejections=warn", bridge, ...bridgeArgs], { stdio: "inherit", env: childEnv })
+  : spawn("supergateway", bridgeArgs, { stdio: "inherit", env: childEnv });
 child.on("error", () => { console.error("[mcps] bridge failed to start"); process.exit(1); });
 child.on("exit", (code) => process.exit(code === null ? 1 : code));
 
@@ -131,6 +148,31 @@ function authorise(req) {
   return null;
 }
 
+// --- lost sessions ----------------------------------------------------------
+
+const MAX_ERROR_BODY = 65536;
+
+// The bridge answers 400 for a session it no longer has - reaped, or gone with
+// a restart. MCP says 404 for that, and 404 is what makes a client start a new
+// session instead of failing every call with the old ID. Any other 400 is kept.
+function answerBadRequest(upstreamRes, res) {
+  const chunks = [];
+  let size = 0;
+  upstreamRes.on("data", (chunk) => {
+    size += chunk.length;
+    if (size <= MAX_ERROR_BODY) chunks.push(chunk);
+  });
+  upstreamRes.on("end", () => {
+    const body = Buffer.concat(chunks);
+    const lost = size <= MAX_ERROR_BODY && body.includes("No valid session ID");
+    const headers = { ...upstreamRes.headers };
+    delete headers["transfer-encoding"];
+    headers["content-length"] = String(body.length);
+    res.writeHead(lost ? 404 : 400, headers);
+    res.end(body);
+  });
+}
+
 // --- proxy -----------------------------------------------------------------
 
 http
@@ -172,6 +214,10 @@ http
     const upstream = http.request(
       { host: "127.0.0.1", port: UPSTREAM, method: req.method, path, headers },
       (upstreamRes) => {
+        if (upstreamRes.statusCode === 400 && req.headers["mcp-session-id"]) {
+          answerBadRequest(upstreamRes, res);
+          return;
+        }
         res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
         res.flushHeaders(); // SSE: get the headers out before the first event
         upstreamRes.pipe(res);
