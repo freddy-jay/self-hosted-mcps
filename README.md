@@ -56,7 +56,7 @@ If setup fails, run `mcps doctor`. On Windows/macOS, start Podman with
 ```
 mcps add <target>   build a server and put it on your tailnet
 mcps ls             what's running, and its URL
-mcps logs <name>    server output (--tailscale for the sidecar, -f to follow)
+mcps logs <name>    server output (--tailscale, --tunnel or --companion for a sidecar, -f to follow)
 mcps restart <name>
 mcps token <name>   show the bearer token (--rotate replaces and applies it)
 mcps client <name>  print OpenAI Codex config (--client openai for Responses API)
@@ -79,6 +79,7 @@ Common flags on `add` (everything else has a default):
 | `-e KEY=VALUE`, `--env-file` | API keys the server needs |
 | `--ref v1.2.0` | pin a branch or tag |
 | `--name` | the tailnet hostname becomes `mcp-<name>` |
+| `--companion IMAGE` | the server needs another program beside it; see **Companion containers** |
 
 For optional token, IP and runtime controls, see `mcps add --help` under
 **Advanced**. You do not need them for normal setup.
@@ -319,6 +320,49 @@ the address is discoverable and let the token do the work. Whether Funnel surfac
 is worth confirming on your first live request — if the gateway sees no
 usable address, use `--allow any` and rely on the token.
 
+## Companion containers
+
+Some MCP servers are only a front for another program: a database, a desktop
+app with an API, a headless browser. `--companion` runs that program's image as
+one more container in the server's pod:
+
+```sh
+mcps add npm:example-mcp --name example \
+  --companion ghcr.io/owner/service:1.4 \
+  --companion-volume /data \
+  --companion-env SERVICE_PASSWORD=... \
+  -e SERVICE_URL=http://127.0.0.1:9000
+```
+
+Containers in a pod share one network namespace, so the server reaches the
+companion on `127.0.0.1`. Nothing new is published: no host port and no Funnel
+entry. The bearer token, Funnel and the OpenAI tunnel behave exactly as before.
+
+| flag | what it does |
+| --- | --- |
+| `--companion IMAGE` | a fully qualified image (`ghcr.io/...`, `localhost/...`); pulled if it is not present. Pin a digest if you need the same bytes on every rebuild |
+| `--companion-volume PATH` | keeps that path in a named Podman volume, `mcps-companion-<name>--<path>`; repeatable |
+| `--companion-env KEY=VALUE` | a Podman secret mounted into the companion only, like `-e` for the server; repeatable |
+| `--companion-port PORT` | forwards that TCP port on your tailnet only; repeatable |
+| `--no-companion` | removes the companion and its secrets on a rebuild |
+
+A rebuild with no companion flags keeps the companion as it was. Passing
+`--companion` again redefines its image, volumes and ports from that command
+alone, so leaving out `--companion-port` closes the port. Environment secrets
+stay until `--no-companion`. Volumes are never removed by a rebuild or by
+`--no-companion`; only `mcps rm` deletes them, with the server.
+
+`--companion-port` is a raw TCP forward with no Funnel entry, so it is never on
+the public internet even for a `--public` server. `mcps` adds no authentication
+to it: any device your tailnet ACLs allow can connect, and the companion's own
+login is the only gate. Ports the pod already uses (80, 443, 8080-8082) are refused.
+
+`mcps logs <name> --companion` shows its output. `add` and `restart` report a
+companion that exited instead of calling the server live, because the MCP
+handshake passes without it. The companion runs with `no-new-privileges` but
+keeps Podman's default capabilities, since arbitrary images often need them;
+treat its image as you would the server's own code.
+
 ## How it works
 
 One pod per server, with containers sharing a network namespace:
@@ -332,6 +376,8 @@ One pod per server, with containers sharing a network namespace:
   with the allowlist and bearer checks, passing SSE straight through.
 - **tunnel** (optional) runs OpenAI's tunnel client, forwarding outbound tunnel
   work to `127.0.0.1:8081/mcp`; local health and polling checks use port 8082.
+- **companion** (optional) runs an image you name with `--companion`, for a
+  program the MCP server talks to over the pod's loopback.
 
 Traffic from your tailnet reaches 8081 directly, since Tailscale ACLs already
 gate it. Public mode sends all traffic through the gateway on 443, so it always requires

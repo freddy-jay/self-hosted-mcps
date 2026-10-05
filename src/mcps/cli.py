@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.table import Table
 
 from mcps import autostart as boot
-from mcps import access, config, detect, podman, probe, tailnet, tunnels, validation
+from mcps import access, companions, config, detect, podman, probe, tailnet, tunnels, validation
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help=__doc__)
 console = Console()
@@ -58,18 +58,21 @@ BRIDGE_PORT = 8081   # supergateway, ungated
 GATEWAY_PORT = 8080  # our gateway: bearer token, optional IP allowlist
 
 
-def serve_config(https: bool, public: bool = False) -> str:
+def serve_config(https: bool, public: bool = False, tcp_ports: tuple[int, ...] = ()) -> str:
     """One listener on the standard port.
 
     Tailnet-only servers go straight to the bridge, since Tailscale ACLs already
     gate them. Public servers put the gateway behind Funnel on 443 - clients that
     reach a connector over the internet will not follow a non-standard port.
+    Companion ports are raw TCP forwards: they have no Funnel entry, so they stay
+    on the tailnet whatever the server's own access is.
     """
     port, scheme = ("443", "HTTPS") if https else ("80", "HTTP")
     host = "${TS_CERT_DOMAIN}:" + port
     upstream = GATEWAY_PORT if public else BRIDGE_PORT
+    forwards = {str(p): {"TCPForward": f"127.0.0.1:{p}"} for p in tcp_ports}
     return json.dumps({
-        "TCP": {port: {scheme: True}},
+        "TCP": {port: {scheme: True}, **forwards},
         "Web": {host: {"Handlers": {"/": {"Proxy": f"http://127.0.0.1:{upstream}"}}}},
         "AllowFunnel": {host: public},
     })
@@ -316,6 +319,11 @@ def add(
     allow: list[str] = typer.Option([], "--allow", rich_help_panel="Advanced", help="Restrict source IPs (CIDR); repeatable. Usually unnecessary."),
     allow_file: Path = typer.Option(None, "--allow-file", exists=True, dir_okay=False, rich_help_panel="Advanced", help="IP list file. Defaults to ~/.mcps/allowlist.txt if present."),
     rebuild_base: bool = typer.Option(False, "--rebuild-base", rich_help_panel="Advanced", help="Rebuild the shared runtime image."),
+    companion: str = typer.Option("", "--companion", rich_help_panel="Companion", help="Image to run beside the server in the same pod, e.g. ghcr.io/owner/image:tag. Rebuilds keep it when omitted."),
+    companion_volume: list[str] = typer.Option([], "--companion-volume", rich_help_panel="Companion", help="Path inside the companion to keep in a persistent volume; repeatable."),
+    companion_env: list[str] = typer.Option([], "--companion-env", rich_help_panel="Companion", help="Companion environment variable KEY=VALUE, stored as a secret; repeatable."),
+    companion_port: list[int] = typer.Option([], "--companion-port", rich_help_panel="Companion", help="Companion TCP port to forward on your tailnet only; repeatable."),
+    no_companion: bool = typer.Option(False, "--no-companion", rich_help_panel="Companion", help="Remove the companion and its secrets. Its volumes stay until mcps rm."),
     force: bool = typer.Option(False, "--force", "-f", help="Replace an existing server with this name."),
 ) -> None:
     """Build an MCP server and put it on your tailnet."""
@@ -348,6 +356,16 @@ def add(
             tunnels.validate_image(saved_image)
         except tunnels.TunnelConfigurationError as exc:
             fail(str(exc))
+    # Same rule for the companion: reject bad flags or saved settings up front.
+    try:
+        saved_companion = companions.from_meta(previous)
+        companion_pairs = companions.parse_env(companion_env)
+        sidecar = companions.resolve(
+            saved_companion, image=companion, volumes=companion_volume,
+            ports=companion_port, env_keys=set(companion_pairs), remove=no_companion,
+        )
+    except companions.CompanionConfigurationError as exc:
+        fail(str(exc))
     public = bool(previous.get("public")) if public is None else public
     silent = bool(previous.get("silent")) if silent is None else silent
     if public and not cfg["https"]:
@@ -430,16 +448,26 @@ def add(
     image = f"localhost/mcps-{name}:latest"
     if podman.stream("build", "-t", image, "-f", str(containerfile), str(source.context)) != 0:
         fail("image build failed. Fix the build, or pass --cmd if the entrypoint was guessed wrong.")
+    if sidecar:
+        console.print(f"[cyan]->[/cyan] companion image: [bold]{sidecar.image}[/bold]")
+        try:
+            companions.ensure_image(sidecar.image)
+        except podman.PodmanError as exc:
+            fail(str(exc))
 
     console.print("[cyan]->[/cyan] starting pod")
     # Keep the working server until input validation and image build succeed.
     if exists:
         podman.destroy(name)
+    if saved_companion and not sidecar:
+        companions.remove_secrets(name, saved_companion.env_keys)
     volume = f"mcps-ts-{name}"
     pod = podman.pod_name(name)
     ts_container = f"{pod}-ts"
     try:
-        podman.write_serve_config(volume, serve_config(cfg["https"], public))
+        podman.write_serve_config(
+            volume, serve_config(cfg["https"], public, sidecar.ports if sidecar else ())
+        )
         podman.run(
             "pod", "create", "--name", pod,
             "--label", f"mcps.name={name}",
@@ -467,6 +495,11 @@ def add(
             *app_args(name, env_keys, bool(token), allow_cidrs, silent),
             image,
         )
+        if sidecar:
+            for key, value in companion_pairs.items():
+                podman.secret_set(companions.env_secret_name(name, key), value)
+            sidecar = companions.with_stored_env(name, sidecar)
+            companions.start(name, sidecar)
         if previous.get("tunnel_id"):
             tunnels.start(name, tunnel_id=previous["tunnel_id"], image=previous["tunnel_image"])
     except podman.PodmanError as exc:
@@ -488,6 +521,7 @@ def add(
         "token_fingerprint": token_fingerprint(token) if token else "",
         "allow_cidrs": allow_cidrs, "env_keys": env_keys, "silent": silent,
         **{k: previous[k] for k in ("tunnel_id", "tunnel_image") if k in previous},
+        **(sidecar.to_meta() if sidecar else {}),
     })
 
     console.print("[cyan]->[/cyan] handshaking with the server")
@@ -510,8 +544,16 @@ def add(
 
     if previous.get("tunnel_id") and not tunnels.wait_ready(name):
         fail(f"MCP server is running, but its OpenAI tunnel is not ready. See: mcps logs {name} --tunnel")
+    # The MCP handshake passes without the companion, so check it separately.
+    if sidecar and not companions.running(name):
+        fail(f"MCP server is running, but its companion container exited. See: mcps logs {name} --companion")
     console.print(f"\n[green]+[/green] [bold]{name}[/bold] is live ({server_name})")
     show_endpoint(name, url, exposed, token, public, ts_container, allow_cidrs)
+    if sidecar:
+        console.print(f"\n  companion: [bold]{sidecar.image}[/bold], on the pod's 127.0.0.1")
+        host = url.split("://", 1)[-1].split("/", 1)[0]
+        for forwarded in sidecar.ports:
+            console.print(f"  tailnet-only TCP: {host}:{forwarded}")
 
 
 def show_endpoint(
@@ -588,6 +630,7 @@ def remove(
     if not known:
         fail(f"no server named '{name}'. See: mcps ls")
     podman.destroy(name)
+    companions.remove_volumes(name)
     if not keep_image:
         podman.run("rmi", "-f", f"localhost/mcps-{name}:latest", check=False)
     podman.secret_rm(podman.secret_name(name, "token"))
@@ -608,13 +651,15 @@ def logs(
     follow: bool = typer.Option(False, "--follow", "-f", help="Stream new output."),
     tailscale: bool = typer.Option(False, "--tailscale", help="Show the tailscale sidecar instead."),
     tunnel: bool = typer.Option(False, "--tunnel", help="Show the OpenAI tunnel sidecar instead."),
+    companion: bool = typer.Option(False, "--companion", help="Show the companion container instead."),
 ) -> None:
     """Show a server's logs."""
     if not podman.pod_exists(name):
         fail(f"no server named '{name}'. See: mcps ls")
-    if tailscale and tunnel:
-        fail("use --tailscale or --tunnel, not both")
-    container = f"{podman.pod_name(name)}-{'tunnel' if tunnel else 'ts' if tailscale else 'app'}"
+    if tailscale + tunnel + companion > 1:
+        fail("use only one of --tailscale, --tunnel or --companion")
+    suffix = "tunnel" if tunnel else "ts" if tailscale else "companion" if companion else "app"
+    container = f"{podman.pod_name(name)}-{suffix}"
     follow_args = ["-f"] if follow else []
     raise typer.Exit(podman.stream("logs", *follow_args, "--tail", "200", container))
 
@@ -636,6 +681,12 @@ def restart(name: str = typer.Argument(..., callback=server_argument, help="Serv
 
     if meta.get("tunnel_id") and not tunnels.wait_ready(name):
         fail(f"MCP server restarted, but its OpenAI tunnel is not ready. See: mcps logs {name} --tunnel")
+    try:
+        has_companion = companions.from_meta(meta) is not None
+    except companions.CompanionConfigurationError as exc:
+        fail(str(exc))
+    if has_companion and not companions.running(name):
+        fail(f"MCP server restarted, but its companion container exited. See: mcps logs {name} --companion")
     console.print(f"[green]+[/green] {name} is back")
     show_endpoint(
         name, url, meta.get("public_url", ""),

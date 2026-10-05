@@ -34,7 +34,7 @@ strict = true
 # Enforce new modules and their tests. Legacy modules still have typing debt;
 # silent follows their interfaces without hiding errors in the listed files.
 follow_imports = "silent"
-files = ["src/mcps/development.py", "src/mcps/tunnels.py", "tests/test_development.py", "tests/test_tunnels.py"]
+files = ["src/mcps/companions.py", "src/mcps/development.py", "src/mcps/tunnels.py", "tests/test_companions.py", "tests/test_development.py", "tests/test_tunnels.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
