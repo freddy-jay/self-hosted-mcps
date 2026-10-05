@@ -63,7 +63,7 @@ mcps client <name>  print OpenAI Codex config (--client openai for Responses API
 mcps tunnel <name>  guided private OpenAI tunnel setup (keeps Tailscale access)
 mcps secrets        add / ls / rm a server's environment secrets
 mcps autostart      bring servers back after a reboot (--enable / --disable)
-mcps rm <name>      pod, tailnet node, image, secret, sources
+mcps rm <name>      pod, tailnet node, image, secrets, sources, companion volumes (--keep-data keeps them)
 mcps doctor
 ```
 
@@ -290,7 +290,9 @@ Copy `allowlist.example.txt` to `~/.mcps/allowlist.txt` (or `$MCPS_HOME/allowlis
 to use it automatically for new public servers. Put one IPv4/IPv6 address or CIDR
 per line; blank lines and `#` comments are ignored. The example contains no active
 ranges. Edit the file and rerun `mcps add` with `--force` to update an existing
-server; running servers keep their saved policy until rebuilt.
+server; running servers keep their saved policy until rebuilt. A server whose
+policy you set with `--allow` or `--allow-file` keeps that choice on a rebuild
+instead of following the default file.
 
 For a one-off override, `--allow` accepts addresses or CIDRs and may be repeated.
 `--allow any` disables the file policy for that server and must be used alone.
@@ -335,33 +337,35 @@ mcps add npm:example-mcp --name example \
 ```
 
 Containers in a pod share one network namespace, so the server reaches the
-companion on `127.0.0.1`. Nothing new is published: no host port and no Funnel
-entry. The bearer token, Funnel and the OpenAI tunnel behave exactly as before.
+companion on `127.0.0.1`. No host port is published and Funnel still carries
+only the server's own HTTPS endpoint, so a companion is never on the public
+internet. The bearer token, Funnel and the OpenAI tunnel behave exactly as before.
 
 | flag | what it does |
 | --- | --- |
 | `--companion IMAGE` | a fully qualified image (`ghcr.io/...`, `localhost/...`); pulled if it is not present. Pin a digest if you need the same bytes on every rebuild |
 | `--companion-volume PATH` | keeps that path in a named Podman volume, `mcps-companion-<name>--<path>`; repeatable |
 | `--companion-env KEY=VALUE` | a Podman secret mounted into the companion only, like `-e` for the server; repeatable |
-| `--companion-port PORT` | forwards that TCP port on your tailnet only; repeatable |
 | `--no-companion` | removes the companion and its secrets on a rebuild |
 
 A rebuild with no companion flags keeps the companion as it was. Passing
-`--companion` again redefines its image, volumes and ports from that command
-alone, so leaving out `--companion-port` closes the port. Environment secrets
-stay until `--no-companion`. Volumes are never removed by a rebuild or by
-`--no-companion`; only `mcps rm` deletes them, with the server.
+`--companion` again redefines its image and volumes from that command alone.
+Environment secrets stay until `--no-companion`. Volumes are never removed by a
+rebuild or by `--no-companion`; `mcps rm` deletes them with the server unless
+you pass `--keep-data`.
 
-`--companion-port` is a raw TCP forward with no Funnel entry, so it is never on
-the public internet even for a `--public` server. `mcps` adds no authentication
-to it: any device your tailnet ACLs allow can connect, and the companion's own
-login is the only gate. Ports the pod already uses (80, 443, 8080-8082) are refused.
+**A companion's ports are reachable from your tailnet.** The pod's Tailscale
+node runs in userspace mode, which hands a tailnet connection on any port to
+the same port on the pod's loopback. Every port the companion listens on is
+therefore open to the devices your tailnet ACLs allow, and `mcps` adds no
+authentication to it. Turn on the companion's own login where it has one, or
+narrow the ACL for these nodes from `tag:mcp:*` to `tag:mcp:443`.
 
 `mcps logs <name> --companion` shows its output. `add` and `restart` report a
-companion that exited instead of calling the server live, because the MCP
-handshake passes without it. The companion runs with `no-new-privileges` but
-keeps Podman's default capabilities, since arbitrary images often need them;
-treat its image as you would the server's own code.
+companion that exited or keeps restarting instead of calling the server live,
+because the MCP handshake passes without it. The companion runs with
+`no-new-privileges` but keeps Podman's default capabilities, since arbitrary
+images often need them; treat its image as you would the server's own code.
 
 ## How it works
 

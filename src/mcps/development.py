@@ -40,4 +40,5 @@ def main() -> None:
         source_file=Path(__file__),
         allow_live_changes=os.environ.get("MCPS_ALLOW_LIVE_CHANGES") == "1",
     )
-    cli.app(args=argv)
+    # No explicit args: Typer then applies its Windows ~ and glob expansion.
+    cli.app()

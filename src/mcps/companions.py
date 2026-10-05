@@ -1,17 +1,18 @@
 """A service container beside the MCP server; they share the pod's loopback."""
 
 import re
+import time
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from mcps import podman, validation
 
-# The pod already listens here: Tailscale serve, the gateway, the bridge and
-# the tunnel health endpoint. Forwarding 8081 would bypass the bearer token.
-RESERVED_PORTS = frozenset({80, 443, 8080, 8081, 8082})
 VOLUME_LABEL = "mcps.companion"
 
-_HOST = r"(?:localhost|[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)"
+_HOST = (
+    r"(?:localhost"
+    r"|[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)"
+)
 _IMAGE = re.compile(
     _HOST
     + r"(?::\d{1,5})?"
@@ -29,14 +30,12 @@ class CompanionConfigurationError(ValueError):
 class Companion:
     image: str
     volumes: tuple[str, ...] = ()
-    ports: tuple[int, ...] = ()
     env_keys: tuple[str, ...] = ()
 
     def to_meta(self) -> dict[str, object]:
         return {
             "companion_image": self.image,
             "companion_volumes": list(self.volumes),
-            "companion_ports": list(self.ports),
             "companion_env_keys": list(self.env_keys),
         }
 
@@ -67,16 +66,6 @@ def validate_mount(path: object) -> str:
     return plain
 
 
-def validate_port(port: object) -> int:
-    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
-        raise CompanionConfigurationError("--companion-port must be 1-65535")
-    if port in RESERVED_PORTS:
-        raise CompanionConfigurationError(
-            f"port {port} is used by the pod itself; pick the companion's own port"
-        )
-    return port
-
-
 def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
 
@@ -101,10 +90,11 @@ def env_secret_name(server: str, key: str) -> str:
 def parse_env(items: Sequence[str]) -> dict[str, str]:
     pairs: dict[str, str] = {}
     for item in items:
-        key, separator, value = item.partition("=")
-        if not separator:
+        key, _, value = item.partition("=")
+        # Podman refuses an empty secret, and by then the old pod is gone.
+        if not value:
             raise CompanionConfigurationError(
-                "--companion-env expects KEY=VALUE, got a value without '='"
+                "--companion-env expects KEY=VALUE with a non-empty value"
             )
         pairs[key] = value
     return pairs
@@ -114,7 +104,6 @@ def build(
     image: object,
     *,
     volumes: Sequence[object] = (),
-    ports: Sequence[object] = (),
     env_keys: Collection[object] = (),
 ) -> Companion:
     mounts = tuple(dict.fromkeys(validate_mount(path) for path in volumes))
@@ -135,7 +124,6 @@ def build(
     return Companion(
         image=validate_image(image),
         volumes=mounts,
-        ports=tuple(dict.fromkeys(validate_port(port) for port in ports)),
         env_keys=tuple(sorted(set(keys))),
     )
 
@@ -144,17 +132,14 @@ def from_meta(meta: Mapping[str, object]) -> Companion | None:
     """Saved settings are re-validated: metadata is a file anyone can edit."""
     if "companion_image" not in meta:
         return None
-    lists: list[list[object]] = []
-    for field in ("companion_volumes", "companion_ports", "companion_env_keys"):
-        value = meta.get(field, [])
-        if not isinstance(value, list):
-            raise CompanionConfigurationError(
-                "invalid saved companion configuration; re-run add with --companion"
-            )
-        lists.append(value)
-    return build(
-        meta["companion_image"], volumes=lists[0], ports=lists[1], env_keys=lists[2]
-    )
+    volumes = meta.get("companion_volumes", [])
+    env_keys = meta.get("companion_env_keys", [])
+    if not isinstance(volumes, list) or not isinstance(env_keys, list):
+        raise CompanionConfigurationError(
+            "invalid saved companion configuration; "
+            "re-run add with --companion IMAGE or --no-companion"
+        )
+    return build(meta["companion_image"], volumes=volumes, env_keys=env_keys)
 
 
 def resolve(
@@ -162,28 +147,26 @@ def resolve(
     *,
     image: str,
     volumes: Sequence[str],
-    ports: Sequence[int],
     env_keys: Collection[str],
     remove: bool,
 ) -> Companion | None:
     """Combine a rebuild's flags with what the server already had.
 
-    No flags keeps the companion. --companion redefines its image, volumes and
-    ports from this command alone. Environment secrets persist either way.
+    No flags keeps the companion. --companion redefines its image and volumes
+    from this command alone. Environment secrets persist either way.
     """
     if remove:
-        if image or volumes or ports or env_keys:
+        if image or volumes or env_keys:
             raise CompanionConfigurationError(
                 "use --no-companion on its own, without other companion options"
             )
         return None
     kept = saved.env_keys if saved else ()
     if image:
-        return build(image, volumes=volumes, ports=ports, env_keys={*kept, *env_keys})
-    if volumes or ports:
+        return build(image, volumes=volumes, env_keys={*kept, *env_keys})
+    if volumes:
         raise CompanionConfigurationError(
-            "pass --companion IMAGE together with --companion-volume and "
-            "--companion-port"
+            "pass --companion IMAGE together with --companion-volume"
         )
     if saved is None:
         if env_keys:
@@ -191,12 +174,7 @@ def resolve(
                 "this server has no companion; pass --companion IMAGE"
             )
         return None
-    return build(
-        saved.image,
-        volumes=saved.volumes,
-        ports=saved.ports,
-        env_keys={*kept, *env_keys},
-    )
+    return build(saved.image, volumes=saved.volumes, env_keys={*kept, *env_keys})
 
 
 def ensure_image(image: str) -> None:
@@ -247,16 +225,31 @@ def start(server: str, companion: Companion) -> None:
     )
 
 
-def running(server: str) -> bool:
-    state = podman.run(
+def _state(server: str) -> tuple[bool, str]:
+    running, _, restarts = podman.run(
         "container",
         "inspect",
         f"{podman.pod_name(server)}-companion",
         "--format",
-        "{{.State.Running}}",
+        "{{.State.Running}} {{.RestartCount}}",
         check=False,
-    )
-    return state == "true"
+    ).partition(" ")
+    return running == "true", restarts
+
+
+def stays_running(server: str, *, fresh: bool, settle: float = 3.0) -> bool:
+    """Is the companion up and not being restarted?
+
+    `--restart always` keeps a crash-looping container "running" most of the
+    time, so one sample is not enough: its restart count must also stand still,
+    and be zero for a container that was only just created.
+    """
+    first = _state(server)
+    time.sleep(settle)
+    second = _state(server)
+    if not (first[0] and second[0]) or first[1] != second[1]:
+        return False
+    return second[1] == "0" or not fresh
 
 
 def remove_secrets(server: str, env_keys: Sequence[str]) -> None:
@@ -264,8 +257,7 @@ def remove_secrets(server: str, env_keys: Sequence[str]) -> None:
         podman.secret_rm(env_secret_name(server, key))
 
 
-def remove_volumes(server: str) -> None:
-    """Delete a removed server's companion data. Rebuilds never call this."""
+def volume_names(server: str) -> list[str]:
     validation.server_name(server)
     listed = podman.run(
         "volume",
@@ -276,7 +268,15 @@ def remove_volumes(server: str) -> None:
         "{{.Name}}",
         check=False,
     )
-    for name in listed.split():
-        # Belt and braces: never trust the filter alone with another server's data.
-        if name.rpartition("--")[0] == f"mcps-companion-{server}":
-            podman.run("volume", "rm", "-f", name, check=False)
+    # Belt and braces: never trust the filter alone with another server's data.
+    return [
+        name
+        for name in listed.split()
+        if name.rpartition("--")[0] == f"mcps-companion-{server}"
+    ]
+
+
+def remove_volumes(server: str) -> None:
+    """Delete a removed server's companion data. Rebuilds never call this."""
+    for name in volume_names(server):
+        podman.run("volume", "rm", "-f", name, check=False)

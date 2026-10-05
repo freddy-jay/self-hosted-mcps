@@ -58,21 +58,18 @@ BRIDGE_PORT = 8081   # supergateway, ungated
 GATEWAY_PORT = 8080  # our gateway: bearer token, optional IP allowlist
 
 
-def serve_config(https: bool, public: bool = False, tcp_ports: tuple[int, ...] = ()) -> str:
+def serve_config(https: bool, public: bool = False) -> str:
     """One listener on the standard port.
 
     Tailnet-only servers go straight to the bridge, since Tailscale ACLs already
     gate them. Public servers put the gateway behind Funnel on 443 - clients that
     reach a connector over the internet will not follow a non-standard port.
-    Companion ports are raw TCP forwards: they have no Funnel entry, so they stay
-    on the tailnet whatever the server's own access is.
     """
     port, scheme = ("443", "HTTPS") if https else ("80", "HTTP")
     host = "${TS_CERT_DOMAIN}:" + port
     upstream = GATEWAY_PORT if public else BRIDGE_PORT
-    forwards = {str(p): {"TCPForward": f"127.0.0.1:{p}"} for p in tcp_ports}
     return json.dumps({
-        "TCP": {port: {scheme: True}, **forwards},
+        "TCP": {port: {scheme: True}},
         "Web": {host: {"Handlers": {"/": {"Proxy": f"http://127.0.0.1:{upstream}"}}}},
         "AllowFunnel": {host: public},
     })
@@ -153,6 +150,8 @@ def report_broken(name: str, url: str, reason: probe.ProbeError, local_ok: bool,
         err.print(f"  See: mcps logs {name}")
         err.print(f"  Then re-run add with -e KEY=VALUE or --cmd, plus --force.")
     err.print(f"  The pod is left running so you can inspect it. Remove it with: mcps rm {name}")
+    if companions.volume_names(name):
+        err.print("  mcps rm also deletes this server's companion data; add --keep-data to keep it.")
 
 
 # The gateway owns these; letting a user secret target one would collide with it.
@@ -322,7 +321,6 @@ def add(
     companion: str = typer.Option("", "--companion", rich_help_panel="Companion", help="Image to run beside the server in the same pod, e.g. ghcr.io/owner/image:tag. Rebuilds keep it when omitted."),
     companion_volume: list[str] = typer.Option([], "--companion-volume", rich_help_panel="Companion", help="Path inside the companion to keep in a persistent volume; repeatable."),
     companion_env: list[str] = typer.Option([], "--companion-env", rich_help_panel="Companion", help="Companion environment variable KEY=VALUE, stored as a secret; repeatable."),
-    companion_port: list[int] = typer.Option([], "--companion-port", rich_help_panel="Companion", help="Companion TCP port to forward on your tailnet only; repeatable."),
     no_companion: bool = typer.Option(False, "--no-companion", rich_help_panel="Companion", help="Remove the companion and its secrets. Its volumes stay until mcps rm."),
     force: bool = typer.Option(False, "--force", "-f", help="Replace an existing server with this name."),
 ) -> None:
@@ -354,15 +352,26 @@ def add(
                 raise tunnels.TunnelConfigurationError("invalid saved tunnel configuration")
             tunnels.validate_id(saved_id)
             tunnels.validate_image(saved_image)
+            if not podman.secret_get(podman.secret_name(name, "openai-key")):
+                raise tunnels.TunnelConfigurationError(
+                    "the saved OpenAI tunnel has no runtime key. "
+                    f"Run: mcps tunnel {name} --remove, then set the tunnel up again"
+                )
         except tunnels.TunnelConfigurationError as exc:
             fail(str(exc))
     # Same rule for the companion: reject bad flags or saved settings up front.
     try:
-        saved_companion = companions.from_meta(previous)
+        try:
+            saved_companion = companions.from_meta(previous)
+        except companions.CompanionConfigurationError:
+            # Broken saved settings must not block replacing or removing them.
+            if not (companion or no_companion):
+                raise
+            saved_companion = None
         companion_pairs = companions.parse_env(companion_env)
         sidecar = companions.resolve(
             saved_companion, image=companion, volumes=companion_volume,
-            ports=companion_port, env_keys=set(companion_pairs), remove=no_companion,
+            env_keys=set(companion_pairs), remove=no_companion,
         )
     except companions.CompanionConfigurationError as exc:
         fail(str(exc))
@@ -389,15 +398,27 @@ def add(
 
     # Opt in only where the proxy supplies a trustworthy source address.
     allow_cidrs = ""
+    allow_source = ""
     if allow_file and allow:
         fail("use --allow-file or --allow, not both")
     if public:
-        policy_path = allow_file or (config.ALLOWLIST_PATH if config.ALLOWLIST_PATH.exists() else None)
+        default_file = config.ALLOWLIST_PATH if config.ALLOWLIST_PATH.exists() else None
+        # A flag-less rebuild keeps a policy the user chose with --allow or
+        # --allow-file. One that came from the default file follows that file,
+        # and a private server has no policy of its own to carry over.
+        keep_saved = bool(previous.get("public")) and "allow_cidrs" in previous and (
+            previous.get("allow_source") == "explicit" or default_file is None
+        )
         try:
-            if not allow and allow_file is None and "allow_cidrs" in previous:
+            if allow or allow_file:
+                allow_cidrs = access.resolve(allow, allow_file)
+                allow_source = "explicit"
+            elif keep_saved:
                 allow_cidrs = access.resolve(previous["allow_cidrs"].split(","), None)
+                allow_source = previous.get("allow_source", "")
             else:
-                allow_cidrs = access.resolve(allow, policy_path)
+                allow_cidrs = access.resolve([], default_file)
+                allow_source = "file" if default_file else ""
         except (ValueError, OSError) as exc:
             fail(str(exc))
 
@@ -416,6 +437,15 @@ def add(
                 validate_env(key)
                 pairs.setdefault(key, value)
     validate_env_keys(set(previous.get("env_keys", [])) | set(pairs))
+
+    # Before the build: a failed pull must not leave a new, never-run app image
+    # tagged for the server that is still running the old one.
+    if sidecar:
+        console.print(f"[cyan]->[/cyan] companion image: [bold]{sidecar.image}[/bold]")
+        try:
+            companions.ensure_image(sidecar.image)
+        except podman.PodmanError as exc:
+            fail(str(exc))
 
     console.print(f"[cyan]->[/cyan] fetching {target}")
     try:
@@ -448,26 +478,16 @@ def add(
     image = f"localhost/mcps-{name}:latest"
     if podman.stream("build", "-t", image, "-f", str(containerfile), str(source.context)) != 0:
         fail("image build failed. Fix the build, or pass --cmd if the entrypoint was guessed wrong.")
-    if sidecar:
-        console.print(f"[cyan]->[/cyan] companion image: [bold]{sidecar.image}[/bold]")
-        try:
-            companions.ensure_image(sidecar.image)
-        except podman.PodmanError as exc:
-            fail(str(exc))
 
     console.print("[cyan]->[/cyan] starting pod")
     # Keep the working server until input validation and image build succeed.
     if exists:
         podman.destroy(name)
-    if saved_companion and not sidecar:
-        companions.remove_secrets(name, saved_companion.env_keys)
     volume = f"mcps-ts-{name}"
     pod = podman.pod_name(name)
     ts_container = f"{pod}-ts"
     try:
-        podman.write_serve_config(
-            volume, serve_config(cfg["https"], public, sidecar.ports if sidecar else ())
-        )
+        podman.write_serve_config(volume, serve_config(cfg["https"], public))
         podman.run(
             "pod", "create", "--name", pod,
             "--label", f"mcps.name={name}",
@@ -519,10 +539,13 @@ def add(
         "name": name, "origin": source.origin, "cmd": run_cmd,
         "url": url, "ip": ip, "image": image, "public": public,
         "token_fingerprint": token_fingerprint(token) if token else "",
-        "allow_cidrs": allow_cidrs, "env_keys": env_keys, "silent": silent,
+        "allow_cidrs": allow_cidrs, "allow_source": allow_source,
+        "env_keys": env_keys, "silent": silent,
         **{k: previous[k] for k in ("tunnel_id", "tunnel_image") if k in previous},
         **(sidecar.to_meta() if sidecar else {}),
     })
+    if saved_companion and not sidecar:
+        companions.remove_secrets(name, saved_companion.env_keys)
 
     console.print("[cyan]->[/cyan] handshaking with the server")
     try:
@@ -540,20 +563,19 @@ def add(
             server_name = "not reachable from this machine yet"
         else:
             report_broken(name, url, exc, healthy, allow_cidrs)
+            if sidecar and not companions.stays_running(name, fresh=True):
+                err.print(f"  Its companion container is not running. See: mcps logs {name} --companion")
             raise typer.Exit(1)
 
     if previous.get("tunnel_id") and not tunnels.wait_ready(name):
         fail(f"MCP server is running, but its OpenAI tunnel is not ready. See: mcps logs {name} --tunnel")
     # The MCP handshake passes without the companion, so check it separately.
-    if sidecar and not companions.running(name):
-        fail(f"MCP server is running, but its companion container exited. See: mcps logs {name} --companion")
+    if sidecar and not companions.stays_running(name, fresh=True):
+        fail(f"MCP server is running, but its companion container is not staying up. See: mcps logs {name} --companion")
     console.print(f"\n[green]+[/green] [bold]{name}[/bold] is live ({server_name})")
     show_endpoint(name, url, exposed, token, public, ts_container, allow_cidrs)
     if sidecar:
         console.print(f"\n  companion: [bold]{sidecar.image}[/bold], on the pod's 127.0.0.1")
-        host = url.split("://", 1)[-1].split("/", 1)[0]
-        for forwarded in sidecar.ports:
-            console.print(f"  tailnet-only TCP: {host}:{forwarded}")
 
 
 def show_endpoint(
@@ -619,6 +641,7 @@ def list_servers() -> None:
 def remove(
     name: str = typer.Argument(..., callback=server_argument, help="Server name."),
     keep_image: bool = typer.Option(False, "--keep-image", help="Leave the built image on disk."),
+    keep_data: bool = typer.Option(False, "--keep-data", help="Leave companion volumes in place."),
 ) -> None:
     """Remove a server, its tailnet node and its data."""
     known = (
@@ -626,11 +649,13 @@ def remove(
         or meta_path(name).exists()
         or bool(podman.secret_get(podman.secret_name(name, "token")))
         or bool(podman.secret_names(f"mcps-{name}-env-"))
+        or bool(companions.volume_names(name))
     )
     if not known:
         fail(f"no server named '{name}'. See: mcps ls")
     podman.destroy(name)
-    companions.remove_volumes(name)
+    if not keep_data:
+        companions.remove_volumes(name)
     if not keep_image:
         podman.run("rmi", "-f", f"localhost/mcps-{name}:latest", check=False)
     podman.secret_rm(podman.secret_name(name, "token"))
@@ -685,8 +710,8 @@ def restart(name: str = typer.Argument(..., callback=server_argument, help="Serv
         has_companion = companions.from_meta(meta) is not None
     except companions.CompanionConfigurationError as exc:
         fail(str(exc))
-    if has_companion and not companions.running(name):
-        fail(f"MCP server restarted, but its companion container exited. See: mcps logs {name} --companion")
+    if has_companion and not companions.stays_running(name, fresh=False):
+        fail(f"MCP server restarted, but its companion container is not staying up. See: mcps logs {name} --companion")
     console.print(f"[green]+[/green] {name} is back")
     show_endpoint(
         name, url, meta.get("public_url", ""),
@@ -762,18 +787,23 @@ def tunnel_setup(
     """
     if (status and remove) or ((status or remove) and (tunnel_id or key_stdin)):
         fail("use setup, --status, or --remove separately")
+    if key_stdin and not tunnel_id:
+        # The ID prompt would read the piped key as the tunnel ID.
+        fail("--key-stdin needs --tunnel-id, because stdin carries the key")
     try:
         podman.preflight()
         meta = require_server(name)
-        if not podman.pod_exists(name):
-            fail("start or rebuild this server before configuring its tunnel")
         if remove:
+            # Works without a pod: a rebuild that failed on a broken tunnel
+            # has none, and removing the tunnel is the way out.
             tunnels.remove(name)
             for key in ("tunnel_id", "tunnel_image"):
                 meta.pop(key, None)
             write_meta(name, meta)
             console.print("Removed the local tunnel. OpenAI tunnel records can be deleted at " + tunnels.SETTINGS_URL)
             return
+        if not podman.pod_exists(name):
+            fail("start or rebuild this server before configuring its tunnel")
         if status:
             if not meta.get("tunnel_id"):
                 fail("no OpenAI tunnel configured; run mcps tunnel " + name)
@@ -801,10 +831,11 @@ def tunnel_setup(
                 key = typer.prompt("Runtime API key (stored only as a Podman secret)", hide_input=True).strip()
         if not key or any(c.isspace() for c in key):
             fail("a non-empty runtime API key without whitespace is required")
-        console.print("Downloading and pinning the official OpenAI tunnel image...")
-        image = tunnels.pull_image()
+        # Stored first, so a retry after a failed download reuses it.
         podman.secret_set(podman.secret_name(name, "openai-key"), key)
         del key
+        console.print("Downloading and pinning the official OpenAI tunnel image...")
+        image = tunnels.pull_image()
         meta.update(tunnel_id=tunnel_id, tunnel_image=image)
         tunnels.start(name, tunnel_id=tunnel_id, image=image)
         # Save immediately so interrupted setup can be inspected or removed.

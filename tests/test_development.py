@@ -39,7 +39,8 @@ class DevelopmentSafetyTests(unittest.TestCase):
             patch.object(cli, "app") as dispatch,
         ):
             invoke_development_cli(["tunnel", "safe"])
-        dispatch.assert_called_once()
+        # No explicit args: Typer then expands ~ and globs itself on Windows.
+        dispatch.assert_called_once_with()
 
     def test_help_from_checkout_is_available_without_opt_in(self) -> None:
         for command in (["--help"], ["add", "--help"], ["secrets", "add", "--help"]):

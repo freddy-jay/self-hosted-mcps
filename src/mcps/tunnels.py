@@ -9,6 +9,7 @@ from mcps import podman
 SETTINGS_URL = "https://platform.openai.com/settings/organization/tunnels"
 KEYS_URL = "https://platform.openai.com/settings/organization/api-keys"
 IMAGE = "ghcr.io/openai/tunnel-client:latest"
+PINNED_IMAGE = re.compile(r"ghcr\.io/openai/tunnel-client@sha256:[a-f0-9]{64}")
 
 
 class TunnelConfigurationError(ValueError):
@@ -24,7 +25,7 @@ def validate_id(value: str) -> str:
 
 
 def validate_image(image: str) -> str:
-    if not re.fullmatch(r"ghcr.io/openai/tunnel-client@sha256:[a-f0-9]{64}", image):
+    if not PINNED_IMAGE.fullmatch(image):
         raise TunnelConfigurationError(
             "invalid saved tunnel image digest; run mcps tunnel again"
         )
@@ -36,7 +37,7 @@ def pull_image() -> str:
     digest = podman.run(
         "image", "inspect", IMAGE, "--format", "{{index .RepoDigests 0}}"
     )
-    if not re.fullmatch(r"ghcr.io/openai/tunnel-client@sha256:[a-f0-9]{64}", digest):
+    if not PINNED_IMAGE.fullmatch(digest):
         raise TunnelConfigurationError("could not pin the official tunnel image digest")
     return digest
 
@@ -74,11 +75,14 @@ def start(name: str, *, tunnel_id: str, image: str) -> None:
 
 def ready(name: str) -> bool:
     # Probe from the app, which shares loopback with the sidecar. Publish no ports.
+    # The pod reports its own time too: the poll timestamp comes from the pod's
+    # clock, which drifts from the host's when a Podman machine sleeps.
     script = (
         'Promise.all(["readyz","metrics"].map(async p=>{'
         'const r=await fetch("http://127.0.0.1:8082/"+p,{signal:AbortSignal.timeout(2000)});'
         'return p==="readyz"?r.status:await r.text()}))'
-        '.then(v=>console.log(JSON.stringify(v))).catch(()=>console.log("[]"))'
+        ".then(v=>console.log(JSON.stringify([...v,Date.now()/1000])))"
+        '.catch(()=>console.log("[]"))'
     )
     raw = podman.run(
         "exec", f"{podman.pod_name(name)}-app", "node", "-e", script, check=False
@@ -87,10 +91,15 @@ def ready(name: str) -> bool:
         result: object = json.loads(raw)
     except ValueError:
         return False
-    if not isinstance(result, list) or len(result) != 2:
+    if not isinstance(result, list) or len(result) != 3:
         return False
-    status, metrics = result
-    return status == 200 and isinstance(metrics, str) and poll_is_recent(metrics)
+    status, metrics, pod_now = result
+    return (
+        status == 200
+        and isinstance(metrics, str)
+        and isinstance(pod_now, int | float)
+        and poll_is_recent(metrics, now=float(pod_now))
+    )
 
 
 def poll_is_recent(metrics: str, now: float | None = None) -> bool:

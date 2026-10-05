@@ -1,13 +1,18 @@
 import json
 import tempfile
+import time
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
+import typer
 from typer.testing import CliRunner
 
 from mcps import cli, config, detect, podman, probe, tunnels
+
+TUNNEL_ID = "tunnel_" + "a" * 32
+PINNED = "ghcr.io/openai/tunnel-client@sha256:" + "a" * 64
 
 
 class TunnelTests(unittest.TestCase):
@@ -352,6 +357,187 @@ class TunnelTests(unittest.TestCase):
                 self.assertEqual("MCP_REQUIRE_TOKEN=1" in app, public)
                 self.assertEqual("MCP_SILENT=1" in app, silent)
                 self.assertEqual("MCP_ALLOW_CIDRS=192.0.2.0/24" in app, bool(policy))
+
+    def test_rebuild_with_a_missing_tunnel_key_stops_before_fetch(self) -> None:
+        cli.write_meta(
+            "safe",
+            {**cli.read_meta("safe"), "tunnel_id": TUNNEL_ID, "tunnel_image": PINNED},
+        )
+        with (
+            patch.object(podman, "preflight"),
+            patch.object(cli, "migrate_authkey"),
+            patch.object(cli, "read_authkey", return_value="fake-key"),
+            patch.object(config, "load", return_value={"https": True}),
+            patch.object(podman, "pod_exists", return_value=True),
+            patch.object(
+                podman,
+                "secret_get",
+                side_effect=lambda n: "" if n.endswith("openai-key") else "t" * 43,
+            ),
+            patch.object(
+                detect, "fetch", side_effect=AssertionError("must not fetch")
+            ) as fetch,
+            patch.object(podman, "destroy") as destroy,
+        ):
+            result = CliRunner().invoke(
+                cli.app, ["add", "pypi:example", "--name", "safe", "--force"]
+            )
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("mcps tunnel safe --remove", " ".join(result.output.split()))
+        fetch.assert_not_called()
+        destroy.assert_not_called()
+
+    def test_remove_works_after_the_pod_is_gone(self) -> None:
+        cli.write_meta(
+            "safe",
+            {**cli.read_meta("safe"), "tunnel_id": TUNNEL_ID, "tunnel_image": PINNED},
+        )
+        with (
+            patch.object(podman, "preflight"),
+            patch.object(podman, "pod_exists", return_value=False),
+            patch.object(podman, "run"),
+            patch.object(podman, "secret_rm") as secret,
+        ):
+            result = CliRunner().invoke(cli.app, ["tunnel", "safe", "--remove"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn("tunnel_id", cli.read_meta("safe"))
+        secret.assert_called_once_with("mcps-safe-openai-key")
+
+    def test_key_stdin_without_tunnel_id_never_reads_the_key_as_the_id(self) -> None:
+        with (
+            patch.object(podman, "preflight"),
+            patch.object(podman, "pod_exists", return_value=True),
+            patch.object(typer, "launch") as launch,
+            patch.object(podman, "secret_set") as secret,
+        ):
+            result = CliRunner().invoke(
+                cli.app, ["tunnel", "safe", "--key-stdin"], input="sk-test-secret\n"
+            )
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("--tunnel-id", result.output)
+        self.assertNotIn("sk-test-secret", result.output)
+        launch.assert_not_called()
+        secret.assert_not_called()
+
+    def test_key_is_stored_before_the_image_pull_so_a_retry_reuses_it(self) -> None:
+        with (
+            patch.object(podman, "preflight"),
+            patch.object(podman, "pod_exists", return_value=True),
+            patch.object(podman, "secret_get", return_value=""),
+            patch.object(podman, "secret_set") as secret,
+            patch.object(
+                tunnels, "pull_image", side_effect=podman.PodmanError("offline")
+            ),
+            patch.object(tunnels, "start") as start,
+        ):
+            result = CliRunner().invoke(
+                cli.app,
+                ["tunnel", "safe", "--tunnel-id", TUNNEL_ID, "--key-stdin"],
+                input="test-secret\n",
+            )
+        self.assertEqual(result.exit_code, 1, result.output)
+        secret.assert_called_once_with("mcps-safe-openai-key", "test-secret")
+        start.assert_not_called()
+        self.assertNotIn("tunnel_id", cli.read_meta("safe"))
+
+    def test_readiness_compares_the_poll_with_the_pods_own_clock(self) -> None:
+        metrics = "commands_poll_last_successful_timestamp_seconds 990\n"
+        with (
+            patch.object(podman, "run", return_value=json.dumps([200, metrics, 1000])),
+            patch.object(time, "time", return_value=99999.0),
+        ):
+            self.assertTrue(tunnels.ready("safe"))
+        with patch.object(podman, "run", return_value=json.dumps([200, metrics, 5000])):
+            self.assertFalse(tunnels.ready("safe"))
+        with patch.object(podman, "run", return_value=json.dumps([200, metrics])):
+            self.assertFalse(tunnels.ready("safe"))
+
+    def test_saved_image_must_come_from_ghcr_io(self) -> None:
+        self.assertEqual(tunnels.validate_image(PINNED), PINNED)
+        for ref in (PINNED.replace("ghcr.io", "ghcr-io"), PINNED.replace(".", "x")):
+            with (
+                self.subTest(ref=ref),
+                self.assertRaises(tunnels.TunnelConfigurationError),
+            ):
+                tunnels.validate_image(ref)
+
+
+class AllowlistRebuildTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.meta = patch.object(cli, "META_DIR", Path(self.temp.name) / "meta")
+        self.meta.start()
+        self.addCleanup(self.meta.stop)
+        self.context = Path(self.temp.name) / "context"
+        self.context.mkdir()
+        self.default_file = Path(self.temp.name) / "allowlist.txt"
+
+    def rebuild(self, saved: dict[str, object], *flags: str) -> dict[str, object]:
+        cli.write_meta("safe", {"name": "safe", **saved})
+        with ExitStack() as stack:
+            for obj, attr, value in (
+                (podman, "preflight", None),
+                (cli, "migrate_authkey", None),
+                (cli, "read_authkey", "fake-key"),
+                (config, "load", {"https": True}),
+                (config, "ALLOWLIST_PATH", None),
+                (podman, "pod_exists", True),
+                (podman, "secret_get", "t" * 43),
+                (
+                    detect,
+                    "fetch",
+                    detect.Source("safe", "pypi:example", self.context),
+                ),
+                (detect, "detect", ("pip install example", "example")),
+                (podman, "ensure_base_image", None),
+                (podman, "stream", 0),
+                (podman, "destroy", None),
+                (cli, "store_env", []),
+                (podman, "secret_set", None),
+                (podman, "write_serve_config", None),
+                (podman, "run", ""),
+                (cli, "wait_online", ("mcp-safe.example", "100.64.0.1")),
+                (probe, "initialize", "example"),
+                (cli, "show_endpoint", None),
+            ):
+                if attr == "ALLOWLIST_PATH":
+                    stack.enter_context(patch.object(obj, attr, self.default_file))
+                else:
+                    stack.enter_context(patch.object(obj, attr, return_value=value))
+            result = CliRunner().invoke(
+                cli.app, ["add", "pypi:example", "--name", "safe", "--force", *flags]
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        return cli.read_meta("safe")
+
+    def test_going_public_applies_the_default_allowlist_file(self) -> None:
+        self.default_file.write_text("192.0.2.0/24\n", encoding="utf-8")
+        meta = self.rebuild({"public": False, "allow_cidrs": ""}, "--public")
+        self.assertEqual(meta["allow_cidrs"], "192.0.2.0/24")
+
+    def test_rebuild_rereads_an_edited_default_allowlist_file(self) -> None:
+        self.default_file.write_text("198.51.100.0/24\n", encoding="utf-8")
+        for saved in (
+            {"public": True, "allow_cidrs": "192.0.2.0/24"},
+            {"public": True, "allow_cidrs": "192.0.2.0/24", "allow_source": "file"},
+        ):
+            with self.subTest(saved=saved):
+                self.assertEqual(self.rebuild(saved)["allow_cidrs"], "198.51.100.0/24")
+
+    def test_explicit_policy_survives_a_rebuild_despite_a_default_file(self) -> None:
+        self.default_file.write_text("198.51.100.0/24\n", encoding="utf-8")
+        cleared = self.rebuild(
+            {"public": True, "allow_cidrs": "192.0.2.0/24"}, "--allow", "any"
+        )
+        self.assertEqual(cleared["allow_cidrs"], "")
+        self.assertEqual(self.rebuild(cleared)["allow_cidrs"], "")
+        chosen = self.rebuild(cleared, "--allow", "203.0.113.7")
+        self.assertEqual(self.rebuild(chosen)["allow_cidrs"], "203.0.113.7/32")
+
+    def test_saved_policy_is_kept_when_there_is_no_default_file(self) -> None:
+        meta = self.rebuild({"public": True, "allow_cidrs": "192.0.2.0/24"})
+        self.assertEqual(meta["allow_cidrs"], "192.0.2.0/24")
 
 
 if __name__ == "__main__":
