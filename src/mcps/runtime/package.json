@@ -1,1 +1,1 @@
-{"name":"mcps-bridge-runtime","private":true,"version":"1.0.0","dependencies":{"supergateway":"3.4.3"},"overrides":{"qs":"6.16.0"}}
+{"name":"mcps-bridge-runtime","private":true,"version":"1.0.0","dependencies":{"supergateway":"4.1.0"},"overrides":{"qs":"6.16.0"}}
