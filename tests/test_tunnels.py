@@ -321,6 +321,12 @@ class TunnelTests(unittest.TestCase):
                     )
                     run = stack.enter_context(patch.object(podman, "run"))
                     start = stack.enter_context(patch.object(tunnels, "start"))
+                    # Not the machine's own ~/.mcps/allowlist.txt.
+                    stack.enter_context(
+                        patch.object(
+                            config, "ALLOWLIST_PATH", Path(self.temp.name) / "none"
+                        )
+                    )
                     result = CliRunner().invoke(
                         cli.app,
                         ["add", "pypi:example", "--name", "safe", "--force", *flags],
