@@ -261,26 +261,47 @@ class RestartAndInitTests(unittest.TestCase):
         self.addCleanup(self.meta.stop)
 
     def test_restart_takes_the_name_back_and_saves_the_stable_url(self) -> None:
-        cli.write_meta(
-            "safe", {"name": "safe", "url": f"https://mcp-safe-1.{SUFFIX}/mcp"}
-        )
-        waits = [
-            (f"mcp-safe-1.{SUFFIX}", "100.64.0.1"),
-            (f"mcp-safe.{SUFFIX}", "100.64.0.1"),
-        ]
-        with (
-            patch.object(podman, "pod_exists", return_value=True),
-            patch.object(podman, "run", return_value="") as run,
-            patch.object(cli, "wait_online", side_effect=waits),
-            patch.object(cli, "claim_node_name", return_value=f"mcp-safe.{SUFFIX}"),
-            patch.object(config, "load", return_value={"https": True}),
-            patch.object(podman, "secret_get", return_value=""),
-            patch.object(cli, "show_endpoint"),
+        stale = f"https://mcp-safe-1.{SUFFIX}/mcp"
+        stable = f"https://mcp-safe.{SUFFIX}/mcp"
+        for public, saved_public_url, expected_public_url in (
+            (True, stale, stable),
+            (False, "", ""),
         ):
-            result = CliRunner().invoke(cli.app, ["restart", "safe"])
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn(call("restart", "mcps-safe-ts"), run.call_args_list)
-        self.assertEqual(cli.read_meta("safe")["url"], f"https://mcp-safe.{SUFFIX}/mcp")
+            with self.subTest(public=public):
+                cli.write_meta(
+                    "safe",
+                    {
+                        "name": "safe",
+                        "url": stale,
+                        "public": public,
+                        "public_url": saved_public_url,
+                    },
+                )
+                waits = [
+                    (f"mcp-safe-1.{SUFFIX}", "100.64.0.1"),
+                    (f"mcp-safe.{SUFFIX}", "100.64.0.1"),
+                ]
+                with (
+                    patch.object(podman, "pod_exists", return_value=True),
+                    patch.object(podman, "run", return_value="") as run,
+                    patch.object(cli, "wait_online", side_effect=waits),
+                    patch.object(
+                        cli, "claim_node_name", return_value=f"mcp-safe.{SUFFIX}"
+                    ),
+                    patch.object(config, "load", return_value={"https": True}),
+                    patch.object(podman, "secret_get", return_value=""),
+                    patch.object(cli, "show_endpoint") as shown,
+                ):
+                    result = CliRunner().invoke(cli.app, ["restart", "safe"])
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertIn(call("restart", "mcps-safe-ts"), run.call_args_list)
+                meta = cli.read_meta("safe")
+                self.assertEqual(meta["url"], stable)
+                self.assertEqual(meta["public_url"], expected_public_url)
+                # What the user is shown is the URL that now works.
+                self.assertEqual(
+                    shown.call_args.args[1:3], (stable, expected_public_url)
+                )
 
     def test_init_stores_the_silent_default_and_leaves_it_alone_otherwise(self) -> None:
         saved: list[dict[str, object]] = []
