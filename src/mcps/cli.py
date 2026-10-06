@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.table import Table
 
 from mcps import autostart as boot
-from mcps import access, companions, config, detect, podman, probe, tailnet, tunnels, validation
+from mcps import access, companions, config, detect, nodename, podman, probe, tailnet, tunnels, validation
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help=__doc__)
 console = Console()
@@ -145,6 +145,9 @@ def report_broken(name: str, url: str, reason: probe.ProbeError, local_ok: bool,
         err.print(f"  The server is up inside the pod, so the tailnet leg failed for {url}.")
         err.print("  HTTPS certificates are a separate toggle from MagicDNS in the Tailscale admin panel.")
         err.print(f"  Enable them, or fall back to plain HTTP: mcps init --http && mcps add ... --force")
+        if allow_cidrs:
+            err.print("  An IP allowlist is set. If this machine is not on it and the server is silent,")
+            err.print("  the setup check is dropped without an answer and looks exactly like this.")
     else:
         err.print("  The MCP process itself is not answering - usually a missing API key or a bad entrypoint.")
         err.print(f"  See: mcps logs {name}")
@@ -224,63 +227,30 @@ def restart_app(name: str) -> None:
     )
 
 
-def node_dns_name(container: str) -> str:
-    proc = subprocess.run(
-        ["podman", "exec", container, "tailscale", "status", "--json"],
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        return ""
-    try:
-        return ((json.loads(proc.stdout).get("Self") or {}).get("DNSName") or "").strip(".")
-    except json.JSONDecodeError:
-        return ""
-
-
-def has_own_name(name: str, dns_name: str) -> bool:
-    return dns_name.split(".", 1)[0] == f"mcp-{name}"
-
-
-def claim_node_name(name: str, container: str, dns_name: str, timeout: int = 20) -> str:
-    """Take mcp-<name> back when the control plane handed out mcp-<name>-1.
-
-    That suffix means another node held the name when this one registered. The
-    control plane only picks a name again when the hostname changes, so rename
-    away and back; it works once the other node is gone. Returns the DNS name
-    the node ends up with, which is still the suffixed one if the name is taken.
-    """
-    if not dns_name or has_own_name(name, dns_name):
-        return dns_name
-    wanted = f"mcp-{name}"
-    current = dns_name
-    try:
-        for hostname in (f"{wanted}-renaming", wanted):
-            subprocess.run(
-                ["podman", "exec", container, "tailscale", "set", f"--hostname={hostname}"],
-                capture_output=True, timeout=30,
-            )
-            # Wait for the control plane to act on this hostname before the next.
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                current = node_dns_name(container) or current
-                if current.split(".", 1)[0].startswith(hostname):
-                    break
-                time.sleep(2)
-    except subprocess.TimeoutExpired:
-        pass
-    return current
+def settle_node_name(name: str, container: str, dns_name: str, ip: str) -> tuple[str, str]:
+    """Take mcp-<name> back if the node came up suffixed; return (dns_name, ip)."""
+    if nodename.claim(name, container, dns_name) == dns_name:
+        return dns_name, ip
+    # The serve config and certificate are bound to the name at start-up.
+    podman.run("restart", container)
+    return wait_online(container)
 
 
 def name_clash_warning(name: str, dns_name: str) -> None:
     # highlight=False: rich would otherwise colour the digits inside the name.
     err.print(
-        f"\n[yellow]![/yellow] this server is on your tailnet as {dns_name.split('.', 1)[0]}, not mcp-{name}:",
+        f"\n[yellow]![/yellow] this server is on your tailnet as {nodename.label(dns_name)}, not mcp-{name}:",
         highlight=False,
     )
     err.print("  another node still holds that name, so the URL above is not the usual one.")
     err.print("  Remove the stale node at login.tailscale.com/admin/machines, then run:")
     err.print(f"  mcps restart {name}")
+
+
+def url_change_notice(old: str, new: str) -> None:
+    if old and old != new:
+        console.print(f"\n[yellow]![/yellow] URL changed from {old}", highlight=False)
+        console.print(f"  to {new}. Update the clients that used the old one.", highlight=False)
 
 
 def wait_online(container: str, timeout: int = 90) -> tuple[str, str]:
@@ -323,7 +293,7 @@ def wait_online(container: str, timeout: int = 90) -> tuple[str, str]:
 @app.command()
 def init(
     authkey: str = typer.Option("", "--authkey", "-k", help="Tailscale auth key (reusable + ephemeral + pre-approved)."),
-    https: bool = typer.Option(True, "--https/--http", help="Serve HTTPS on the tailnet (needs MagicDNS + HTTPS certs enabled)."),
+    https: bool | None = typer.Option(None, "--https/--http", help="Serve HTTPS on the tailnet (needs MagicDNS + HTTPS certs enabled). HTTPS unless you chose --http before."),
     tags: str = typer.Option("", "--tags", help="Extra tailscaled args, e.g. --advertise-tags=tag:mcp"),
     silent_default: bool | None = typer.Option(None, "--silent-default/--no-silent-default", help="Make new public servers drop unauthorised requests without answering."),
 ) -> None:
@@ -344,7 +314,8 @@ def init(
         if not authkey.startswith("tskey-"):
             fail("that does not look like a Tailscale auth key (expected it to start with 'tskey-').")
         podman.secret_set(config.AUTHKEY_SECRET, authkey.strip())
-    cfg["https"] = https
+    if https is not None:
+        cfg["https"] = https
     if tags:
         cfg["ts_extra_args"] = tags
     if silent_default is not None:
@@ -440,8 +411,11 @@ def add(
     except companions.CompanionConfigurationError as exc:
         fail(str(exc))
     public = bool(previous.get("public")) if public is None else public
-    # A server's own saved choice wins; `mcps init --silent-default` covers new ones.
-    silent = bool(previous.get("silent", cfg.get("silent", False))) if silent is None else silent
+    if silent is None:
+        # Every server has `silent` saved, but only on a public one was it a
+        # choice. Anything else follows `mcps init --silent-default`.
+        chosen = bool(previous.get("public")) and "silent" in previous
+        silent = bool(previous["silent"] if chosen else cfg.get("silent", False))
     if public and not cfg["https"]:
         fail("--public needs HTTPS: Funnel is TLS-only on port 443. Run: mcps init --https")
     exists = podman.pod_exists(name)
@@ -546,9 +520,19 @@ def add(
 
     console.print("[cyan]->[/cyan] starting pod")
     # Keep the working server until input validation and image build succeed.
-    if exists:
-        # Same tailnet node afterwards: the name and URL must survive a rebuild.
-        podman.destroy(name, keep_identity=True)
+    # A deployed server is rebuilt as the same tailnet node, so its name and URL
+    # survive - also across failed attempts, when the pod is already gone. The
+    # node is replaced only when tailscaled would carry over what must change:
+    # its saved `tailscale up` flags, or a Funnel config left from public access.
+    ts_extra_args = cfg.get("ts_extra_args", "")
+    same_node = (
+        bool(previous.get("url"))
+        and bool(previous.get("public")) == public
+        and previous.get("ts_extra_args", ts_extra_args) == ts_extra_args
+    )
+    if exists or not same_node:
+        # Clean up first: a pod, or state left behind by an earlier attempt.
+        podman.destroy(name, keep_identity=same_node)
     volume = f"mcps-ts-{name}"
     pod = podman.pod_name(name)
     ts_container = f"{pod}-ts"
@@ -561,7 +545,7 @@ def add(
             "--label", f"mcps.cmd={run_cmd}",
             "--label", f"mcps.public={str(public).lower()}",
         )
-        extra = ("-e", f"TS_EXTRA_ARGS={cfg['ts_extra_args']}") if cfg.get("ts_extra_args") else ()
+        extra = ("-e", f"TS_EXTRA_ARGS={ts_extra_args}") if ts_extra_args else ()
         podman.run(
             "run", "-d", "--pod", pod, "--name", ts_container, "--restart", "always",
             "--secret", f"{config.AUTHKEY_SECRET},type=env,target=TS_AUTHKEY",
@@ -589,18 +573,17 @@ def add(
         if previous.get("tunnel_id"):
             tunnels.start(name, tunnel_id=previous["tunnel_id"], image=previous["tunnel_image"])
     except podman.PodmanError as exc:
-        podman.destroy(name, keep_identity=exists)
+        podman.destroy(name, keep_identity=same_node)
         fail(str(exc))
 
     try:
-        dns_name, ip = wait_online(ts_container)
-        if claim_node_name(name, ts_container, dns_name) != dns_name:
-            # The serve config and certificate are bound to the name at start-up.
-            podman.run("restart", ts_container)
-            dns_name, ip = wait_online(ts_container)
-    except (typer.Exit, podman.PodmanError):
-        podman.destroy(name, keep_identity=exists)
+        dns_name, ip = settle_node_name(name, ts_container, *wait_online(ts_container))
+    except typer.Exit:
+        podman.destroy(name, keep_identity=same_node)
         raise
+    except podman.PodmanError as exc:
+        podman.destroy(name, keep_identity=same_node)
+        fail(str(exc))
 
     url = server_url(cfg, name, dns_name)
     exposed = url if public else ""
@@ -610,6 +593,7 @@ def add(
         "url": url, "ip": ip, "image": image, "public": public,
         "token_fingerprint": token_fingerprint(token) if token else "",
         "allow_cidrs": allow_cidrs, "allow_source": allow_source,
+        "ts_extra_args": ts_extra_args,
         "env_keys": env_keys, "silent": silent,
         **{k: previous[k] for k in ("tunnel_id", "tunnel_image") if k in previous},
         **(sidecar.to_meta() if sidecar else {}),
@@ -644,7 +628,8 @@ def add(
         fail(f"MCP server is running, but its companion container is not staying up. See: mcps logs {name} --companion")
     console.print(f"\n[green]+[/green] [bold]{name}[/bold] is live ({server_name})")
     show_endpoint(name, url, exposed, token, public, ts_container, allow_cidrs)
-    if not has_own_name(name, dns_name):
+    url_change_notice(previous.get("url", ""), url)
+    if nodename.unsettled(name, dns_name):
         name_clash_warning(name, dns_name)
     if sidecar:
         console.print(f"\n  companion: [bold]{sidecar.image}[/bold], on the pod's 127.0.0.1")
@@ -768,17 +753,19 @@ def restart(name: str = typer.Argument(..., callback=server_argument, help="Serv
         fail(f"no server named '{name}'. See: mcps ls")
     pod = podman.pod_name(name)
     podman.run("pod", "restart", pod)
-    dns_name, ip = wait_online(f"{pod}-ts")
-    if claim_node_name(name, f"{pod}-ts", dns_name) != dns_name:
-        podman.run("restart", f"{pod}-ts")
-        dns_name, ip = wait_online(f"{pod}-ts")
+    try:
+        dns_name, ip = settle_node_name(name, f"{pod}-ts", *wait_online(f"{pod}-ts"))
+    except podman.PodmanError as exc:
+        fail(str(exc))
 
     meta = read_meta(name)
     url = server_url(config.load(), name, dns_name)
-    if url != meta.get("url"):
-        meta.update({"url": url, "ip": ip})
-        if meta.get("public"):
-            meta["public_url"] = url
+    previous_url = meta.get("url", "")
+    # public_url is the URL of a public server and nothing else; deriving it
+    # also repairs metadata where an older version let the two drift apart.
+    current = {"url": url, "public_url": url if meta.get("public") else ""}
+    if any(meta.get(key) != value for key, value in current.items()):
+        meta.update(current, ip=ip)
         write_meta(name, meta)
 
     if meta.get("tunnel_id") and not tunnels.wait_ready(name):
@@ -795,7 +782,8 @@ def restart(name: str = typer.Argument(..., callback=server_argument, help="Serv
         podman.secret_get(podman.secret_name(name, "token")),
         bool(meta.get("public")), f"{pod}-ts", meta.get("allow_cidrs", ""),
     )
-    if not has_own_name(name, dns_name):
+    url_change_notice(previous_url, url)
+    if nodename.unsettled(name, dns_name):
         name_clash_warning(name, dns_name)
 
 
