@@ -1,5 +1,5 @@
 PYTHON ?= $(if $(wildcard .venv/Scripts/python.exe),.venv/Scripts/python.exe,$(if $(wildcard .venv/bin/python),.venv/bin/python,python))
-CHECKED_PYTHON = src/mcps/companions.py src/mcps/development.py src/mcps/tunnels.py tests/test_companions.py tests/test_development.py tests/test_runtime_image.py tests/test_tunnels.py
+CHECKED_PYTHON = src/mcps/companions.py src/mcps/development.py src/mcps/tunnels.py tests/test_companions.py tests/test_development.py tests/test_rebuild_identity.py tests/test_runtime_image.py tests/test_tunnels.py
 
 .PHONY: check
 check:

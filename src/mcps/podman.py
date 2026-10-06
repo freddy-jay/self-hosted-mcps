@@ -73,20 +73,27 @@ def list_pods() -> list[dict]:
     return [p for p in pods if (p.get("Labels") or {}).get("mcps.name")]
 
 
-def destroy(name: str) -> None:
-    # Log out first so the control plane drops the node immediately. Without this
-    # the old ephemeral node lingers, and the replacement takes the next free
-    # hostname - mcp-<name>-1, then -2 - changing the URL on every rebuild.
-    try:
-        subprocess.run(
-            ["podman", "exec", f"{pod_name(name)}-ts", "tailscale", "logout"],
-            capture_output=True, timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        # Best effort logout: an offline control plane must not prevent cleanup.
-        pass
+def destroy(name: str, *, keep_identity: bool = False) -> None:
+    """Remove a server's pod, and its tailnet node unless a rebuild will reuse it.
+
+    A rebuild keeps the Tailscale state volume, so the new pod comes back as the
+    same node with the same name and URL. Logging out and registering again
+    races the control plane: while the old node is still listed, the new one is
+    named mcp-<name>-1 and every configured client points at a dead address.
+    """
+    if not keep_identity:
+        # Log out so the control plane drops the node at once and frees its name.
+        try:
+            subprocess.run(
+                ["podman", "exec", f"{pod_name(name)}-ts", "tailscale", "logout"],
+                capture_output=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            # Best effort logout: an offline control plane must not prevent cleanup.
+            pass
     subprocess.run(["podman", "pod", "rm", "-f", pod_name(name)], capture_output=True)
-    subprocess.run(["podman", "volume", "rm", "-f", f"mcps-ts-{name}"], capture_output=True)
+    if not keep_identity:
+        subprocess.run(["podman", "volume", "rm", "-f", f"mcps-ts-{name}"], capture_output=True)
 
 
 def write_serve_config(volume: str, serve_json: str) -> None:
