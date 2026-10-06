@@ -13,7 +13,7 @@ RUNTIME = Path(__file__).parent / "runtime"
 # An image that already carries this tag is reused as it is. Bump the tag with
 # every change to what base.Containerfile copies in, or rebuilt servers keep the
 # old gateway and bridge without a word (tests/test_runtime_image.py enforces it).
-BASE_IMAGE = os.environ.get("MCPS_BASE_IMAGE", "localhost/mcps-base:3")
+BASE_IMAGE = os.environ.get("MCPS_BASE_IMAGE", "localhost/mcps-base:4")
 TS_IMAGE = os.environ.get("MCPS_TS_IMAGE", "docker.io/tailscale/tailscale:latest")
 POD_PREFIX = "mcps-"
 

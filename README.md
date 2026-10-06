@@ -472,7 +472,7 @@ overridable:
 | `MCPS_HOME` | `~/.mcps` — settings, server metadata and clones; no secrets |
 | `TS_AUTHKEY` | read by `mcps init` so the key can be set non-interactively |
 | `MCPS_TAILSCALE` | path to the host `tailscale` binary |
-| `MCPS_BASE_IMAGE` | `localhost/mcps-base:3` |
+| `MCPS_BASE_IMAGE` | `localhost/mcps-base:4` |
 | `MCPS_TS_IMAGE` | `docker.io/tailscale/tailscale:latest` |
 
 The runtime image takes `--build-arg NODE_IMAGE=...`. Bridge dependencies live in
