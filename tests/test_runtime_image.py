@@ -8,8 +8,8 @@ from mcps import podman
 BAKED_IN = ("base.Containerfile", "gateway.js", "package.json", "package-lock.json")
 
 # Change these two together, and only together with the tag in podman.py.
-TAG = "localhost/mcps-base:3"
-CONTENT_SHA256 = "42c0420507ef89d7c915ccbb90d00f73ceb781e673c2d74bd924d06adab74aed"
+TAG = "localhost/mcps-base:4"
+CONTENT_SHA256 = "fc82f514a71e683e08b09e9672d3521627b4733c15b69e8053ac530a3febd280"
 
 
 def baked_in_digest() -> str:

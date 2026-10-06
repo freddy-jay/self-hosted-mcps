@@ -236,7 +236,13 @@ The token is stored in a **podman secret**, not on disk in your home directory:
 `podman inspect` shows it as `*******`, where a plain `-e` variable shows the
 value. The same applies to your Tailscale auth key, which lives in the
 `mcps-authkey` secret rather than in `config.json`. 
-Rebuilds keep the token, so a connector you already configured keeps working.
+Rebuilds keep the token and the tailnet node, so the URL and the credential of a
+connector you already configured both stay valid. The node is replaced only when
+you switch a server between public and private, change the Tailscale flags given
+to `mcps init --tags`, store a different auth key, or pass `--new-node` to ask for
+one. If a server ever comes up as `mcp-<name>-1`, another
+node still holds its name: `mcps` tries to take the name back, tells you when the
+URL changed, and otherwise names the stale node to remove.
 `mcps token <name>` prints it, `--rotate` replaces it and recreates the app container to apply it immediately;
 `--new-token` on `add` does the same during a rebuild. `add` and `restart` do not
 print credentials. For clients without headers, the compatibility URL is
@@ -322,7 +328,9 @@ URLs, tokens, query strings and raw forwarding headers.
 `--silent` drops unauthorised connections instead of answering, so a scanner
 gets a reset rather than a 401 confirming something is listening. Turn it on
 after a client is working: setup wizards often probe without credentials first,
-and a silent drop is indistinguishable from an unreachable host.
+and a silent drop is indistinguishable from an unreachable host. To make it the
+default for every new public server, run `mcps init --silent-default`; a server's
+own `--silent` or `--no-silent` still wins.
 
 **Your URL is not a secret.** Tailscale obtains a Let's Encrypt certificate for
 `mcp-<name>.<tailnet>.ts.net`, and every issued certificate is recorded in the
@@ -467,7 +475,7 @@ overridable:
 | `MCPS_HOME` | `~/.mcps` — settings, server metadata and clones; no secrets |
 | `TS_AUTHKEY` | read by `mcps init` so the key can be set non-interactively |
 | `MCPS_TAILSCALE` | path to the host `tailscale` binary |
-| `MCPS_BASE_IMAGE` | `localhost/mcps-base:3` |
+| `MCPS_BASE_IMAGE` | `localhost/mcps-base:4` |
 | `MCPS_TS_IMAGE` | `docker.io/tailscale/tailscale:latest` |
 
 The runtime image takes `--build-arg NODE_IMAGE=...`. Bridge dependencies live in

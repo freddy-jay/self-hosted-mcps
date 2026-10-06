@@ -17,7 +17,7 @@ ALLOWLIST_PATH = HOME / "allowlist.txt"
 
 AUTHKEY_SECRET = "mcps-authkey"
 
-DEFAULTS = {"tailnet": "", "https": True, "ts_extra_args": ""}
+DEFAULTS = {"tailnet": "", "https": True, "ts_extra_args": "", "silent": False}
 
 
 def load() -> dict:

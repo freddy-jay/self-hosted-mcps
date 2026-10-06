@@ -206,13 +206,13 @@ class CompanionCliTests(unittest.TestCase):
             events.append(args[0])
             return 0
 
-        def destroy(server: str) -> None:
+        def destroy(server: str, *, keep_identity: bool = False) -> None:
             events.append("destroy")
 
         def online(container: str, timeout: int = 90) -> tuple[str, str]:
             if online_fails:
                 raise typer.Exit(1)
-            return ("mcp-safe.example", "100.64.0.1")
+            return (f"mcp-{name}.example", "100.64.0.1")
 
         def handshake(url: str, token: str) -> str:
             if handshake_fails:
