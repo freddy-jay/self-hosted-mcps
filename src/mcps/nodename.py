@@ -38,18 +38,17 @@ def was_suffixed(name: str, dns_name: str) -> bool:
     return re.fullmatch(pattern, label(dns_name)) is not None
 
 
-def unsettled(name: str, dns_name: str) -> bool:
-    """Is the node on a name its clients do not expect: suffixed, or mid-rename?"""
-    return was_suffixed(name, dns_name) or label(dns_name) == away_hostname(name)
-
-
 def current(container: str) -> str:
     """The node's DNS name as its sidecar reports it, or "" when it cannot say."""
-    proc = subprocess.run(
-        ["podman", "exec", container, "tailscale", "status", "--json"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["podman", "exec", container, "tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return ""
     if proc.returncode != 0:
         return ""
     try:
@@ -93,11 +92,21 @@ def claim(name: str, container: str, dns_name: str, *, timeout: float = 20) -> s
     """
     if not was_suffixed(name, dns_name):
         return dns_name
-    away = away_hostname(name)
-    if _set_hostname(container, away):
-        # `tailscale set` returns before the control plane has acted on it.
-        _wait_for(container, lambda seen: seen == away, timeout)
+    away, wanted = away_hostname(name), wanted_hostname(name)
+    sent = _set_hostname(container, away)
+    # `tailscale set` returns before the control plane has acted on it.
+    landed = (
+        sent and label(_wait_for(container, lambda seen: seen == away, timeout)) == away
+    )
     # Ask for the real hostname again whatever happened above, so a failure
     # half way never leaves the node on the throwaway name.
-    _set_hostname(container, wanted_hostname(name))
-    return _wait_for(container, lambda seen: seen != away, timeout) or dns_name
+    _set_hostname(container, wanted)
+    if not sent:
+        return current(container) or dns_name
+    # Once the throwaway name was seen, any other name is the control plane's
+    # answer. If it never showed, both renames may still be on their way, so
+    # only the wanted name counts as an answer before the deadline.
+    settled = _wait_for(
+        container, lambda seen: seen == wanted or (landed and seen != away), timeout
+    )
+    return settled or dns_name

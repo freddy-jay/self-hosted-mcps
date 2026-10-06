@@ -104,6 +104,12 @@ class NodeNameTests(unittest.TestCase):
             ):
                 self.assertEqual(nodename.current("mcps-safe-ts"), expected)
 
+    def test_a_hung_status_call_is_bounded_and_reads_as_unknown(self) -> None:
+        hung = subprocess.TimeoutExpired("podman", 30)
+        with patch.object(subprocess, "run", side_effect=hung) as run:
+            self.assertEqual(nodename.current("mcps-safe-ts"), "")
+        self.assertIsNotNone(run.call_args.kwargs.get("timeout"))
+
 
 class ClaimTests(unittest.TestCase):
     """The control plane acts on a rename some polls after `tailscale set`."""
@@ -197,14 +203,20 @@ class ClaimTests(unittest.TestCase):
         got, ran, polls = self.claim([self.dns("mcp-safe-1")] * 100)
         self.assertEqual(got, self.dns("mcp-safe-1"))
         self.assertEqual(ran[-1], set_hostname("mcp-safe"))
-        self.assertLess(polls, 12)
+        # Two waits of 10 simulated seconds, polled every 2.
+        self.assertLessEqual(polls, 14)
 
-    def test_a_node_left_on_the_throwaway_name_is_reported_as_unsettled(self) -> None:
+    def test_a_late_answer_is_not_mistaken_for_a_name_that_is_still_taken(self) -> None:
+        # The throwaway name never shows up in time, then both renames land.
+        # Reporting "still suffixed" at once would save a URL about to die.
+        late = [self.dns("mcp-safe-1")] * 8 + [self.dns("mcp-safe")]
+        got, ran, _ = self.claim(late)
+        self.assertEqual(got, self.dns("mcp-safe"))
+        self.assertEqual(ran, [set_hostname(self.away), set_hostname("mcp-safe")])
+
+    def test_a_node_left_on_the_throwaway_name_is_reported_as_it_is(self) -> None:
         got, _, _ = self.claim([self.dns(self.away)] * 100)
         self.assertEqual(got, self.dns(self.away))
-        self.assertTrue(nodename.unsettled("safe", got))
-        self.assertFalse(nodename.unsettled("safe", self.dns("mcp-safe")))
-        self.assertFalse(nodename.unsettled("safe", self.dns("tools")))
 
 
 class RebuildCliTests(unittest.TestCase):
@@ -239,6 +251,7 @@ class RebuildCliTests(unittest.TestCase):
         claimed: str | None = None,
         cfg: Mapping[str, object] | None = None,
         restart_fails: bool = False,
+        authkey: str = "tskey-auth-first",
     ) -> tuple[Result, MagicMock, MagicMock, list[tuple[str, ...]]]:
         answers = list(online or [(f"mcp-safe.{SUFFIX}", "100.64.0.1")])
         calls: list[tuple[str, ...]] = []
@@ -264,7 +277,7 @@ class RebuildCliTests(unittest.TestCase):
             for obj, attr, value in (
                 (podman, "preflight", None),
                 (cli, "migrate_authkey", None),
-                (cli, "read_authkey", "fake-key"),
+                (cli, "read_authkey", authkey),
                 (config, "load", {"https": True, "ts_extra_args": TAGS, **(cfg or {})}),
                 (podman, "pod_exists", exists),
                 (podman, "secret_get", "t" * 43),
@@ -355,6 +368,26 @@ class RebuildCliTests(unittest.TestCase):
                     destroy.call_args_list, [call("safe", keep_identity=False)]
                 )
 
+    def test_new_node_can_be_asked_for_and_a_changed_auth_key_implies_it(self) -> None:
+        self.deployed()
+        result, destroy, _, _ = self.add("--force", "--new-node", exists=True)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(destroy.call_args_list, [call("safe", keep_identity=False)])
+        saved = cli.read_meta("safe")["authkey_fingerprint"]
+        self.assertNotIn("tskey-auth-first", json.dumps(cli.read_meta("safe")))
+
+        # Same key: the node is reused. Another key (another tailnet, or other
+        # tags) must not resume the node the old key registered.
+        result, destroy, _, _ = self.add("--force", exists=True)
+        self.assertEqual(destroy.call_args_list, [call("safe", keep_identity=True)])
+        self.assertEqual(cli.read_meta("safe")["authkey_fingerprint"], saved)
+        result, destroy, _, _ = self.add(
+            "--force", exists=True, authkey="tskey-auth-second"
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(destroy.call_args_list, [call("safe", keep_identity=False)])
+        self.assertNotEqual(cli.read_meta("safe")["authkey_fingerprint"], saved)
+
     def test_a_server_built_before_flags_were_recorded_keeps_its_node(self) -> None:
         # Its metadata cannot say which flags it was started with, so they are
         # taken as unchanged rather than costing every such server its name.
@@ -419,7 +452,40 @@ class RebuildCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 1, result.output)
         self.assertIsInstance(result.exception, SystemExit)
         self.assertIn("podman restart failed", flat(result))
-        self.assertEqual(destroy.call_args_list[-1], call("safe", keep_identity=False))
+        self.assertIn("mcps restart safe", flat(result))
+        # Only the clean-up before the deploy: the pod that came online stays.
+        self.assertEqual(destroy.call_args_list, [call("safe", keep_identity=False)])
+
+    def test_a_rebuilt_server_that_is_online_survives_a_failed_name_reclaim(
+        self,
+    ) -> None:
+        self.deployed()
+        for failure in ("restart", "second wait"):
+            with self.subTest(failure=failure):
+                result, destroy, _, _ = self.add(
+                    "--force",
+                    exists=True,
+                    online=[(f"mcp-safe-1.{SUFFIX}", "100.64.0.1"), None]
+                    if failure == "second wait"
+                    else [(f"mcp-safe-1.{SUFFIX}", "100.64.0.1")],
+                    claimed=f"mcp-safe.{SUFFIX}",
+                    restart_fails=failure == "restart",
+                )
+                self.assertEqual(result.exit_code, 1, result.output)
+                self.assertEqual(
+                    destroy.call_args_list, [call("safe", keep_identity=True)]
+                )
+                self.assertIn("mcps restart safe", flat(result))
+
+    def test_a_node_caught_mid_rename_is_not_blamed_on_a_stale_node(self) -> None:
+        away = nodename.away_hostname("safe")
+        result, _, _, _ = self.add(
+            "--public", exists=False, online=[(f"{away}.{SUFFIX}", "100.64.0.1")]
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn("another node", flat(result))
+        self.assertIn("still settling", flat(result))
+        self.assertIn("mcps restart safe", flat(result))
 
     def test_new_public_servers_follow_the_configured_silent_default(self) -> None:
         for cfg, flags, expected in (
@@ -443,6 +509,14 @@ class RebuildCliTests(unittest.TestCase):
         result, _, _, _ = self.add(
             "--force", "--public", exists=True, cfg={"silent": True}
         )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue(cli.read_meta("safe")["silent"])
+
+    def test_silent_survives_a_round_trip_through_private(self) -> None:
+        self.deployed(silent=True)
+        result, _, _, _ = self.add("--force", "--private", exists=True)
+        self.assertEqual(result.exit_code, 0, result.output)
+        result, _, _, _ = self.add("--force", "--public", exists=True)
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertTrue(cli.read_meta("safe")["silent"])
 
@@ -472,6 +546,7 @@ class RestartTests(unittest.TestCase):
         *,
         claimed: str | None = None,
         restart_fails: bool = False,
+        pod_restart_fails: bool = False,
     ) -> tuple[Result, list[tuple[str, ...]], MagicMock]:
         cli.write_meta("safe", {"name": "safe", **meta})
         calls: list[tuple[str, ...]] = []
@@ -485,6 +560,8 @@ class RestartTests(unittest.TestCase):
             calls.append(args)
             if restart_fails and args == ("restart", "mcps-safe-ts"):
                 raise podman.PodmanError("podman restart failed: no such container")
+            if pod_restart_fails and args[:2] == ("pod", "restart"):
+                raise podman.PodmanError("podman pod restart failed: container stuck")
             return ""
 
         with (
@@ -561,6 +638,16 @@ class RestartTests(unittest.TestCase):
         self.assertIsInstance(result.exception, SystemExit)
         self.assertIn("podman restart failed", flat(result))
         self.assertNotIn("is back", flat(result))
+
+    def test_a_failed_pod_restart_ends_cleanly_not_with_a_traceback(self) -> None:
+        result, _, _ = self.restart(
+            {"url": STABLE, "public": False},
+            [(f"mcp-safe.{SUFFIX}", "100.64.0.1")],
+            pod_restart_fails=True,
+        )
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIsInstance(result.exception, SystemExit)
+        self.assertIn("podman pod restart failed", flat(result))
 
 
 class InitTests(unittest.TestCase):
