@@ -238,8 +238,9 @@ value. The same applies to your Tailscale auth key, which lives in the
 `mcps-authkey` secret rather than in `config.json`. 
 Rebuilds keep the token and the tailnet node, so the URL and the credential of a
 connector you already configured both stay valid. The node is replaced only when
-you switch a server between public and private, or change the Tailscale flags
-given to `mcps init --tags`. If a server ever comes up as `mcp-<name>-1`, another
+you switch a server between public and private, change the Tailscale flags given
+to `mcps init --tags`, store a different auth key, or pass `--new-node` to ask for
+one. If a server ever comes up as `mcp-<name>-1`, another
 node still holds its name: `mcps` tries to take the name back, tells you when the
 URL changed, and otherwise names the stale node to remove.
 `mcps token <name>` prints it, `--rotate` replaces it and recreates the app container to apply it immediately;
